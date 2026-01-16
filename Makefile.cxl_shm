@@ -1,0 +1,31 @@
+# Makefile for compiling cxl_shm.c to shared library
+# Usage: make -f Makefile.cxl_shm
+
+CC = gcc
+CFLAGS = -shared -fPIC -O2 -Wall -fvisibility=hidden -std=c11
+LDFLAGS = -lrt -lpthread -march=native
+
+# Source files
+CXL_SHM_SRC = cxl_shm.c mem_hash.c
+CXL_SHM_HEADER = cxl_shm.h mem_hash.h
+CXL_SHM_LIB = libcxl_shm.so
+
+# Default target
+all: $(CXL_SHM_LIB)
+
+# Compile shared library
+$(CXL_SHM_LIB): $(CXL_SHM_SRC) $(CXL_SHM_HEADER)
+	$(CC) $(CFLAGS) -o $(CXL_SHM_LIB) $(CXL_SHM_SRC) $(LDFLAGS)
+	@echo "Built $(CXL_SHM_LIB) successfully"
+
+# Clean
+clean:
+	rm -f $(CXL_SHM_LIB)
+
+# Install (copy to common locations)
+install: $(CXL_SHM_LIB)
+	cp $(CXL_SHM_LIB) /usr/local/lib/ || echo "Failed to install to /usr/local/lib"
+	ldconfig || echo "ldconfig failed (may need sudo)"
+
+.PHONY: all clean install
+

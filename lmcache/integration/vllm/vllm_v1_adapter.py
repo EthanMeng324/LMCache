@@ -1265,6 +1265,7 @@ class LMCacheConnectorV1Impl:
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
+            logger.info("wait_for_save: skipping save because kv_role is kv_consumer")
             return
 
         if self.use_layerwise:
@@ -1318,15 +1319,6 @@ class LMCacheConnectorV1Impl:
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
-
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
 
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:

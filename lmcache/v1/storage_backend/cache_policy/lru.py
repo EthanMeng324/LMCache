@@ -12,6 +12,8 @@ from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy,
 
 logger = init_logger(__name__)
 
+KeyType = CacheEngineKey
+
 
 class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
     """
@@ -23,6 +25,8 @@ class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
         self.chunk_hash_to_init_timestamp: Dict[Any, float] = {}
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.max_num_chunk_hash = 12500000
+        # Track access count for each key
+        self.key_to_access_count: Dict[KeyType, int] = {}
 
     def init_mutable_mapping(self) -> OrderedDict[KeyType, Any]:
         return OrderedDict()
@@ -48,6 +52,8 @@ class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
         cache_dict: OrderedDict[KeyType, Any],
     ) -> None:
         self.update_chunk_hash_dict(key)
+        # Increment access count
+        self.key_to_access_count[key] = self.key_to_access_count.get(key, 0) + 1
         cache_dict.move_to_end(key)
 
     def update_on_put(
@@ -55,13 +61,16 @@ class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
         key: KeyType,
     ) -> None:
         self.update_chunk_hash_dict(key)
-        pass
+        # Initialize access count for new key
+        if key not in self.key_to_access_count:
+            self.key_to_access_count[key] = 0
 
     def update_on_force_evict(
         self,
         key: KeyType,
     ) -> None:
-        pass
+        # Remove access count when evicted
+        self.key_to_access_count.pop(key, None)
 
     # NOTE(Jiayi): We do best effort to get eviction candidates so the number
     # of returned keys mignt be smaller than num_candidates.
@@ -79,3 +88,24 @@ class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
                 break
 
         return evict_keys
+
+    def get_access_count(self, key: KeyType) -> int:
+        """
+        Get the access count for a given key.
+        
+        Args:
+            key: The cache key
+            
+        Returns:
+            The number of times this key has been accessed
+        """
+        return self.key_to_access_count.get(key, 0)
+    
+    def get_all_access_counts(self) -> Dict[KeyType, int]:
+        """
+        Get access counts for all keys.
+        
+        Returns:
+            A dictionary mapping keys to their access counts
+        """
+        return self.key_to_access_count.copy()

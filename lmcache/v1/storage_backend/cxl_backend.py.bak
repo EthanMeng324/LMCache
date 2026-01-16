@@ -1,0 +1,989 @@
+# SPDX-License-Identifier: Apache-2.0
+# Standard
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+import asyncio
+import hashlib
+import itertools
+import mmap
+import os
+import queue
+import re
+import subprocess
+import threading
+import time
+
+# Third Party
+import ctypes
+import numpy as np
+import torch
+
+# First Party
+from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
+from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata, TensorMemoryObj
+from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.cache_controller.worker import LMCacheWorker
+
+logger = init_logger(__name__)
+
+# DAX devices typically require 2MB alignment
+DAX_ALIGNMENT = 2 * 1024 * 1024  # 2MB
+
+# Default DAX device path
+DEFAULT_DAX_DEVICE = "/dev/dax0.0"
+
+# Use a simple slot-based structure on DAX device
+# Each key maps to a fixed-size slot based on its hash
+# Slot size: 8MB (enough for most KV cache pages)
+SLOT_SIZE = 8 * 1024 * 1024  # 8MB per slot
+DEFAULT_MAX_SLOTS = 100000  # Default maximum number of slots
+METADATA_SIZE = 16  # [magic:4B][version:4B][slot_size:4B][max_slots:4B]
+SLOT_METADATA_SIZE = 12  # [key_len:4B][value_size:8B] per slot
+
+
+class CxlWorker:
+    def __init__(self) -> None:
+        self.pq: queue.PriorityQueue[tuple[int, int, str, Callable, dict[str, Any]]] = (
+            queue.PriorityQueue()
+        )
+
+        # TODO(Jiayi): remove this hard code.
+        num_workers = 1
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+
+        self.put_lock = threading.Lock()
+        self.prefetch_lock = threading.Lock()
+        self.put_tasks: List[CacheEngineKey] = []
+
+        # Optional means the prefetch task in queue but not
+        # started yet.
+        self.prefetch_tasks: dict[CacheEngineKey, Optional[Future]] = {}
+
+        self.counter = itertools.count()
+
+        self.thread = threading.Thread(target=self.process_task, daemon=True)
+        self.thread.start()
+
+    def submit_task(
+        self,
+        task_type: str,
+        task: Callable,
+        **kwargs,
+    ):
+        if task_type == "prefetch":
+            priority = 0
+            self.insert_prefetch_task(kwargs["key"], None)
+        elif task_type == "delete":
+            priority = 1
+        elif task_type == "put":
+            priority = 2
+            self.insert_put_task(kwargs["key"])
+        else:
+            raise ValueError(f"Unknown task type: {task_type}")
+
+        self.pq.put((priority, next(self.counter), task_type, task, kwargs))
+
+    def process_task(self):
+        while True:
+            _, _, task_type, task, kwargs = self.pq.get(block=True)
+
+            future = self.executor.submit(task, **kwargs)
+            if task_type == "prefetch":
+                # Remove the prefetch task from the queue
+                self.insert_prefetch_task(kwargs["key"], future)
+
+            self.pq.task_done()
+
+    def remove_put_task(self, key: CacheEngineKey):
+        with self.put_lock:
+            if key in self.put_tasks:
+                self.put_tasks.remove(key)
+            else:
+                logger.warning(f"Key {key} not found in put tasks.")
+
+    def insert_put_task(self, key: CacheEngineKey):
+        with self.put_lock:
+            self.put_tasks.append(key)
+
+    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+        with self.put_lock:
+            return key in self.put_tasks
+
+    def remove_prefetch_task(self, key: CacheEngineKey):
+        with self.prefetch_lock:
+            if key in self.prefetch_tasks:
+                self.prefetch_tasks.pop(key)
+            else:
+                logger.warning(f"Key {key} not found in prefetch tasks.")
+
+    def insert_prefetch_task(
+        self,
+        key: CacheEngineKey,
+        future_or_none: Optional[Future] = None,
+    ):
+        with self.prefetch_lock:
+            self.prefetch_tasks[key] = future_or_none
+
+    def exists_in_prefetch_tasks(self, key: CacheEngineKey) -> bool:
+        with self.prefetch_lock:
+            return key in self.prefetch_tasks
+
+    def wait_prefetch_task(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """
+        Wait for the prefetch task to complete and return the MemoryObj.
+        If the key is not in the prefetch tasks, return None.
+        """
+
+        while True:
+            self.prefetch_lock.acquire()
+            if key not in self.prefetch_tasks:
+                self.prefetch_lock.release()
+                return None
+
+            logger.debug(f"Waiting for prefetch task for key {key} to complete.")
+            future = self.prefetch_tasks[key]
+            if future is None:
+                self.prefetch_lock.release()
+                time.sleep(0.01)
+                continue
+
+            self.prefetch_lock.release()
+
+            memory_obj = future.result()
+            return memory_obj
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+        self.thread.join()
+
+
+class CxlBackend(StorageBackendInterface):
+    """
+    CXL (Compute Express Link) storage backend using DAX device.
+    Uses slot-based storage structure similar to sglang's CXLMemoryPool.
+    Each key is stored in a fixed-size slot based on its hash.
+    """
+
+    def __init__(
+        self,
+        config: LMCacheEngineConfig,
+        loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+        dst_device: str = "cuda",
+        lmcache_worker: Optional["LMCacheWorker"] = None,
+    ):
+        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.dict = self.cache_policy.init_mutable_mapping()
+
+        self.dst_device = dst_device
+        self.local_cpu_backend = local_cpu_backend
+        self.cxl_lock = threading.Lock()
+
+        # Get DAX device path from config
+        if config.extra_config is not None:
+            self.dax_device = config.extra_config.get("cxl_dax_device", DEFAULT_DAX_DEVICE)
+            # Allow override via environment variable
+            self.dax_device = os.getenv("LMCACHE_CXL_DAX_DEVICE", self.dax_device)
+        else:
+            self.dax_device = os.getenv("LMCACHE_CXL_DAX_DEVICE", DEFAULT_DAX_DEVICE)
+
+        if not os.path.exists(self.dax_device):
+            raise FileNotFoundError(
+                f"DAX device {self.dax_device} not found. "
+                f"Please ensure the device exists and is accessible."
+            )
+
+        # Get max_cxl_size from config early (may be used as fallback for device size)
+        max_cxl_size_gb = 0.0
+        if config.extra_config is not None:
+            max_cxl_size_gb = config.extra_config.get("max_cxl_size", 0.0)
+        max_cxl_size_bytes = int(max_cxl_size_gb * 1024**3) if max_cxl_size_gb > 0 else 0
+
+        # Get device size
+        try:
+            # First, try to get size from environment variable (most reliable)
+            env_size = os.getenv("LMCACHE_CXL_DAX_DEVICE_SIZE", None)
+            if env_size:
+                self.device_size = int(env_size)
+            else:
+                # Try os.stat (may return 0 for character devices)
+                stat_info = os.stat(self.dax_device)
+                self.device_size = stat_info.st_size
+                
+                # If st_size is 0, try to get size from ndctl
+                if self.device_size == 0:
+                    try:
+                        # Get device name from path (e.g., /dev/dax1.0 -> dax1.0)
+                        device_name = os.path.basename(self.dax_device)
+                        # Run ndctl list -X to get device-dax info
+                        result = subprocess.run(
+                            ["ndctl", "list", "-X"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if result.returncode == 0:
+                            # Parse output to find device size
+                            lines = result.stdout.split("\n")
+                            for i, line in enumerate(lines):
+                                if device_name in line:
+                                    # Look for size in nearby lines
+                                    for j in range(max(0, i - 5), min(len(lines), i + 5)):
+                                        size_match = re.search(r'size[:\s]+(\d+)', lines[j], re.IGNORECASE)
+                                        if size_match:
+                                            self.device_size = int(size_match.group(1))
+                                            break
+                                    if self.device_size > 0:
+                                        break
+                    except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError, AttributeError):
+                        pass
+                
+                # If still 0, try to use max_cxl_size as device size hint
+                if self.device_size == 0:
+                    if max_cxl_size_bytes > 0:
+                        logger.warning(
+                            f"Cannot determine device size for {self.dax_device} automatically. "
+                            f"Using max_cxl_size ({max_cxl_size_gb} GB) as device size. "
+                            f"Please verify this matches the actual device size. "
+                            f"For more accurate results, set LMCACHE_CXL_DAX_DEVICE_SIZE environment variable."
+                        )
+                        self.device_size = max_cxl_size_bytes
+                    else:
+                        raise ValueError(
+                            f"Cannot determine device size for {self.dax_device}. "
+                            f"DAX devices (character devices) don't report size via os.stat().\n"
+                            f"Please use one of the following options:\n"
+                            f"  1. Set LMCACHE_CXL_DAX_DEVICE_SIZE environment variable:\n"
+                            f"     export LMCACHE_CXL_DAX_DEVICE_SIZE=8589934592  # 8GB in bytes\n"
+                            f"  2. Set max_cxl_size in extra_config (will be used as device size):\n"
+                            f"     extra_config:\n"
+                            f"       max_cxl_size: 8.0  # 8GB\n"
+                            f"  3. Use ndctl to query device size (if available)"
+                        )
+        except ValueError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to get device size: {e}") from e
+
+        # Calculate MAX_SLOTS based on available device size
+        # Account for DAX alignment requirements
+        aligned_device_size = (self.device_size // DAX_ALIGNMENT) * DAX_ALIGNMENT
+        
+        # Reserve some space for metadata and ensure we have at least a few slots
+        available_for_slots = aligned_device_size - METADATA_SIZE
+        slot_overhead = SLOT_METADATA_SIZE + SLOT_SIZE
+        self.max_slots = max(1, available_for_slots // slot_overhead)
+        
+        # Use a reasonable maximum to avoid excessive memory usage
+        self.max_slots = min(self.max_slots, DEFAULT_MAX_SLOTS)
+        
+        # Verify we have at least minimal space
+        required_size = METADATA_SIZE + self.max_slots * slot_overhead
+        if aligned_device_size < required_size:
+            raise ValueError(
+                f"Aligned device size {aligned_device_size} is too small. "
+                f"Minimum required: {required_size} (for {self.max_slots} slots)"
+            )
+        
+        logger.info(
+            f"Configured {self.max_slots} slots for device size {self.device_size} bytes "
+            f"({self.device_size / (1024**3):.2f} GB)"
+        )
+
+        # Open and mmap the DAX device
+        aligned_size = None
+        map_size = None
+        try:
+            self.dax_fd = os.open(self.dax_device, os.O_RDWR)
+            # Calculate the total size we need to map
+            total_size = METADATA_SIZE + self.max_slots * (SLOT_METADATA_SIZE + SLOT_SIZE)
+            # Ensure we don't exceed device size
+            map_size = min(total_size, self.device_size)
+            
+            # Align map_size to DAX_ALIGNMENT boundary (round up)
+            aligned_size = ((map_size + DAX_ALIGNMENT - 1) // DAX_ALIGNMENT) * DAX_ALIGNMENT
+            # But don't exceed device size
+            aligned_size = min(aligned_size, self.device_size)
+            
+            # Recalculate max_slots if needed
+            if aligned_size < total_size:
+                available_for_slots = aligned_size - METADATA_SIZE
+                slot_overhead = SLOT_METADATA_SIZE + SLOT_SIZE
+                actual_max_slots = available_for_slots // slot_overhead
+                if actual_max_slots < self.max_slots:
+                    logger.warning(f"Reducing max_slots from {self.max_slots} to {actual_max_slots} "
+                                 f"due to alignment constraints")
+                    self.max_slots = actual_max_slots
+            
+            self.mmap_size = aligned_size
+            logger.info(f"Mapped {aligned_size} bytes (requested {total_size}, device size {self.device_size}, max_slots={self.max_slots})")
+            
+            # For DAX devices, use simple mmap call with aligned size
+            # The offset parameter defaults to 0, which is already aligned
+            self.mmap_obj = mmap.mmap(
+                self.dax_fd, aligned_size, access=mmap.ACCESS_WRITE, offset=0
+            )
+        except PermissionError as e:
+            if hasattr(self, "dax_fd"):
+                try:
+                    os.close(self.dax_fd)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"Permission denied when opening DAX device {self.dax_device}. "
+                f"Please ensure you have read/write permissions. "
+                f"Original error: {e}"
+            ) from e
+        except Exception as e:
+            if hasattr(self, "dax_fd"):
+                try:
+                    os.close(self.dax_fd)
+                except Exception:
+                    pass
+            error_msg = f"Failed to mmap DAX device: {e}. "
+            if aligned_size is not None and map_size is not None:
+                error_msg += f"Tried to map {aligned_size} bytes (aligned from {map_size}). "
+            error_msg += f"Device size: {self.device_size} bytes."
+            raise RuntimeError(error_msg) from e
+
+        self.loop = loop
+        self.use_local_cpu = config.local_cpu
+
+        self.cxl_worker = CxlWorker()
+
+        # Get max CXL cache size from config (for eviction tracking)
+        # Note: max_cxl_size is used for eviction tracking, not device size
+        # If not set, use the mapped size as the limit
+        if max_cxl_size_gb > 0:
+            self.max_cache_size = max_cxl_size_bytes
+        else:
+            self.max_cache_size = aligned_size
+        self.current_cache_size = 0.0
+
+        # to help maintain suffix -> prefix order in the dict
+        self.keys_in_request: List[CacheEngineKey] = []
+
+        self.lmcache_worker = lmcache_worker
+        self.instance_id = config.lmcache_instance_id
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.usage = 0
+
+    def __str__(self):
+        return "CxlBackend"
+
+    def _get_slot_offset(self, key: CacheEngineKey) -> tuple[int, int]:
+        """Get slot offset for a key based on its hash."""
+        # Convert key to string for hashing
+        key_str = key.to_string()
+        # Hash the key to get a slot index
+        key_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+        slot_idx = int(key_hash[:8], 16) % self.max_slots
+        
+        # Calculate offset: metadata + slot_idx * (slot_metadata + slot_size) + slot_metadata
+        slot_offset = (
+            METADATA_SIZE
+            + slot_idx * (SLOT_METADATA_SIZE + SLOT_SIZE)
+            + SLOT_METADATA_SIZE  # Skip slot metadata, point to data area
+        )
+        return slot_offset, slot_idx
+
+    def _get_slot_metadata_offset(self, slot_idx: int) -> int:
+        """Get metadata offset for a slot."""
+        return METADATA_SIZE + slot_idx * (SLOT_METADATA_SIZE + SLOT_SIZE)
+
+    def _read_slot_metadata(self, slot_idx: int) -> tuple[int, int]:
+        """Read slot metadata: (key_len, value_size)."""
+        offset = self._get_slot_metadata_offset(slot_idx)
+        key_len = int.from_bytes(self.mmap_obj[offset : offset + 4], "little")
+        value_size = int.from_bytes(self.mmap_obj[offset + 4 : offset + 12], "little")
+        return key_len, value_size
+
+    def _write_slot_metadata(self, slot_idx: int, key_len: int, value_size: int):
+        """Write slot metadata."""
+        offset = self._get_slot_metadata_offset(slot_idx)
+        self.mmap_obj[offset : offset + 4] = key_len.to_bytes(4, "little")
+        self.mmap_obj[offset + 4 : offset + 12] = value_size.to_bytes(8, "little")
+
+    def _get_slot_key(self, slot_idx: int) -> Optional[str]:
+        """Get the key stored in a slot (for verification)."""
+        key_len, _ = self._read_slot_metadata(slot_idx)
+        if key_len == 0:
+            return None
+        # Key is stored at the beginning of slot data area
+        key_offset = METADATA_SIZE + slot_idx * (SLOT_METADATA_SIZE + SLOT_SIZE) + SLOT_METADATA_SIZE
+        if key_len > SLOT_SIZE:
+            return None
+        key_bytes = self.mmap_obj[key_offset : key_offset + key_len]
+        return key_bytes.decode("utf-8", errors="ignore")
+
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        with self.cxl_lock:
+            if key not in self.dict:
+                # Check if key exists in DAX device
+                key_str = key.to_string()
+                slot_offset, slot_idx = self._get_slot_offset(key)
+                key_len, value_size = self._read_slot_metadata(slot_idx)
+                if key_len == 0 or value_size == 0:
+                    return False
+                
+                # Verify key matches
+                stored_key = self._get_slot_key(slot_idx)
+                if stored_key != key_str:
+                    return False
+                
+                # Key exists in DAX, add to dict
+                size = value_size
+                shape = None  # Will be read from actual data if needed
+                dtype = None
+                fmt = None
+                # Use a dummy path for metadata
+                path = f"slot_{slot_idx}"
+                self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
+            
+            if pin:
+                self.dict[key].pin()
+                self.keys_in_request.append(key)
+            return True
+
+    def touch_cache(self):
+        # flip the order of the keys in the request
+        with self.cxl_lock:
+            for key in reversed(self.keys_in_request):
+                self.cache_policy.update_on_hit(key, self.dict)
+            self.keys_in_request = []
+
+    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+        return self.cxl_worker.exists_in_put_tasks(key)
+
+    def pin(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        with self.cxl_lock:
+            if key in self.dict:
+                self.dict[key].pin()
+                return True
+            else:
+                return False
+
+    def unpin(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        with self.cxl_lock:
+            if key in self.dict:
+                self.dict[key].unpin()
+                return True
+            else:
+                return False
+
+    def remove(
+        self,
+        key: CacheEngineKey,
+        force: bool = True,
+    ) -> bool:
+        if force:
+            self.cxl_lock.acquire()
+
+        if not (meta := self.dict.pop(key, None)):
+            if force:
+                self.cxl_lock.release()
+            return False
+
+        size = meta.size
+        slot_offset, slot_idx = self._get_slot_offset(key)
+
+        # Clear slot metadata (mark as empty)
+        self._write_slot_metadata(slot_idx, 0, 0)
+
+        self.usage -= size
+        self.stats_monitor.update_local_storage_usage(self.usage)
+        self.current_cache_size -= size
+
+        if force:
+            self.cache_policy.update_on_force_evict(key)
+            self.cxl_lock.release()
+
+        # push kv evict msg
+        if self.lmcache_worker is not None:
+            self.lmcache_worker.put_msg(
+                KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
+            )
+
+        return True
+
+    def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        size = memory_obj.get_physical_size()
+        shape = memory_obj.metadata.shape
+        dtype = memory_obj.metadata.dtype
+        fmt = memory_obj.metadata.fmt
+        slot_offset, slot_idx = self._get_slot_offset(key)
+
+        has_stored = False
+        with self.cxl_lock:
+            # Need to do reinsert to update cache recency
+            if key in self.dict:
+                self.dict.pop(key)
+                has_stored = True
+
+            # Use slot index as path identifier
+            path = f"slot_{slot_idx}"
+            self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
+
+        # push kv admit msg
+        if self.lmcache_worker is not None and not has_stored:
+            self.lmcache_worker.put_msg(
+                KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
+            )
+
+    def submit_put_task(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ):
+        assert memory_obj.tensor is not None
+
+        # skip repeated save
+        if self.exists_in_put_tasks(key):
+            logger.debug(f"Put task for {key} is already in progress.")
+            return None
+
+        # TODO(Jiayi): Fragmentation is not considered here.
+        required_size = memory_obj.get_physical_size()
+        with self.cxl_lock:
+            while self.current_cache_size + required_size > self.max_cache_size:
+                evict_keys = self.cache_policy.get_evict_candidates(
+                    self.dict, num_candidates=1
+                )
+                if not evict_keys:
+                    logger.warning(
+                        "No eviction candidates found.", "CXL space under pressure."
+                    )
+                    return None
+
+                for evict_key in evict_keys:
+                    self.current_cache_size -= self.dict[evict_key].size
+
+                self.batched_remove(evict_keys, force=False)
+            self.current_cache_size += required_size
+
+        self.cache_policy.update_on_put(key)
+        memory_obj.ref_count_up()
+
+        self.cxl_worker.submit_task(
+            "put",
+            self.async_save_bytes_to_cxl,
+            key=key,
+            memory_obj=memory_obj,
+        )
+
+    def batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec=None,
+    ) -> None:
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            self.submit_put_task(key, memory_obj)
+
+    def submit_prefetch_task(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        assert self.use_local_cpu, "prefetch and local_cpu must be enabled together"
+
+        logger.debug("Submitting prefetch task")
+
+        self.cxl_lock.acquire()
+        if key not in self.dict:
+            self.cxl_lock.release()
+            return False
+
+        # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
+        self.cache_policy.update_on_hit(key, self.dict)
+
+        if self.cxl_worker.exists_in_prefetch_tasks(key):
+            logger.debug(f"Prefetch task for {key} is already in progress.")
+            self.cxl_lock.release()
+            return False
+
+        cxl_meta = self.dict[key]
+        dtype = cxl_meta.dtype
+        shape = cxl_meta.shape
+        fmt = cxl_meta.fmt
+
+        assert dtype is not None
+        assert shape is not None
+
+        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+        if memory_obj is None:
+            self.cxl_lock.release()
+            logger.debug("Memory allocation failed during async CXL load.")
+            return False
+
+        self.dict[key].pin()
+
+        # Update cache recency
+        self.cache_policy.update_on_hit(key, self.dict)
+
+        self.cxl_lock.release()
+        logger.debug(f"Prefetching {key} from CXL.")
+
+        self.cxl_worker.submit_task(
+            "prefetch",
+            self.async_load_bytes_from_cxl,
+            key=key,
+            memory_obj=memory_obj,
+        )
+
+        return True
+
+    def get_blocking(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[MemoryObj]:
+        """
+        Blocking get function.
+        """
+        self.cxl_lock.acquire()
+        if key not in self.dict:
+            # Try to find key in DAX device
+            if not self.contains(key, pin=False):
+                self.cxl_lock.release()
+                return None
+
+        self.cache_policy.update_on_hit(key, self.dict)
+
+        self.cxl_lock.release()
+
+        if memory_obj := self.cxl_worker.wait_prefetch_task(key):
+            if self.local_cpu_backend.contains(key, pin=True):
+                return memory_obj
+
+        self.cxl_lock.acquire()
+        # Update cache recency
+        self.cache_policy.update_on_hit(key, self.dict)
+
+        cxl_meta = self.dict[key]
+        dtype = cxl_meta.dtype
+        shape = cxl_meta.shape
+        fmt = cxl_meta.fmt
+        assert dtype is not None
+        assert shape is not None
+
+        memory_obj = self.load_bytes_from_cxl(
+            key, dtype=dtype, shape=shape, fmt=fmt
+        )
+        self.cxl_lock.release()
+
+        return memory_obj
+
+    def get_non_blocking(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[Future]:
+        """
+        Non-blocking get function.
+        Using a dummy wrapper around prefetch for now.
+        """
+        raise NotImplementedError(
+            "Non-blocking get is not implemented for CxlBackend. "
+        )
+
+    def get_allocator_backend(self):
+        return self.local_cpu_backend
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def async_save_bytes_to_cxl(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> None:
+        """
+        Convert KV to bytes and async store bytes to CXL memory via mmap.
+        """
+        kv_chunk = memory_obj.tensor
+        assert kv_chunk is not None
+        buffer = memory_obj.byte_array
+
+        size = len(buffer)
+        self.usage += size
+        self.stats_monitor.update_local_storage_usage(self.usage)
+
+        # Write to CXL via mmap
+        self.write_cxl_mmap(key, buffer)
+
+        self.insert_key(key, memory_obj)
+
+        # ref count down here because there's a ref_count_up in
+        # `submit_put_task` above
+        memory_obj.ref_count_down()
+
+        self.cxl_worker.remove_put_task(key)
+
+    def async_load_bytes_from_cxl(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ):
+        """
+        Async load bytearray from CXL memory via mmap.
+        """
+
+        logger.debug("Executing `async_load_bytes` from CXL.")
+        buffer = memory_obj.byte_array
+        self.read_cxl_mmap(key, buffer)
+
+        self.cxl_lock.acquire()
+        self.dict[key].unpin()
+        self.cxl_lock.release()
+
+        # Write back to cpu
+        self.local_cpu_backend.submit_put_task(key, memory_obj)
+
+        self.cxl_worker.remove_prefetch_task(key)
+
+        return memory_obj
+
+    def _create_tensor_from_mmap(self, offset: int, size: int) -> torch.Tensor:
+        """
+        Create a torch tensor directly from mmap at the given offset.
+        This avoids copying data from CXL to DRAM.
+        """
+        # Get the memory address of the mmap at the given offset
+        # mmap objects support buffer protocol, so we can use memoryview
+        mmap_mv = memoryview(self.mmap_obj[offset : offset + size])
+        
+        # Create a ctypes array from the memoryview
+        # This gives us direct access to the CXL memory without copy
+        array_type = ctypes.c_uint8 * size
+        cxl_array = array_type.from_buffer(mmap_mv)
+        
+        # Create torch tensor from buffer (no copy, directly references CXL memory)
+        cxl_tensor = torch.frombuffer(cxl_array, dtype=torch.uint8)
+        
+        return cxl_tensor
+
+    def load_bytes_from_cxl(
+        self,
+        key: CacheEngineKey,
+        dtype: torch.dtype,
+        shape: torch.Size,
+        fmt: MemoryFormat,
+    ) -> Optional[MemoryObj]:
+        """
+        Load bytearray from CXL memory via mmap.
+        Directly creates MemoryObj pointing to CXL memory (no copy).
+        """
+        key_str = key.to_string()
+        slot_offset, slot_idx = self._get_slot_offset(key)
+        
+        # Read metadata
+        key_len, value_size = self._read_slot_metadata(slot_idx)
+        if key_len == 0 or value_size == 0:
+            return None
+        
+        # Verify key matches
+        stored_key = self._get_slot_key(slot_idx)
+        if stored_key != key_str:
+            return None
+        
+        # Calculate data offset (skip key)
+        key_len_bytes = len(key_str.encode("utf-8"))
+        data_offset = slot_offset + key_len_bytes
+        
+        # Calculate the offset in the mmap (absolute offset from start)
+        # slot_offset is already relative to mmap start, so data_offset is too
+        mmap_data_offset = data_offset
+        
+        # Create tensor directly from CXL mmap (no copy)
+        cxl_tensor = self._create_tensor_from_mmap(mmap_data_offset, value_size)
+        
+        # Reshape and view as the correct dtype
+        num_elements = value_size // dtype.itemsize
+        cxl_tensor = cxl_tensor[:num_elements * dtype.itemsize].view(dtype).view(shape)
+        
+        # Create MemoryObjMetadata
+        metadata = MemoryObjMetadata(
+            shape=shape,
+            dtype=dtype,
+            address=0,  # Not used for CXL-backed objects
+            phy_size=value_size,
+            ref_count=1,
+            pin_count=0,
+            fmt=fmt,
+        )
+        
+        # Create MemoryObj directly from CXL tensor (no parent allocator, as it's in CXL)
+        # Note: We don't set parent_allocator because this memory is managed by CXL backend
+        memory_obj = TensorMemoryObj(
+            raw_data=cxl_tensor,
+            metadata=metadata,
+            parent_allocator=None,  # CXL memory is managed by the backend, not an allocator
+        )
+        
+        return memory_obj
+
+    def write_cxl_mmap(self, key: CacheEngineKey, buffer: bytearray):
+        """
+        Write buffer to CXL memory using slot-based structure.
+        Note: This still requires a copy from DRAM to CXL, as the source data
+        is typically in DRAM. However, we use memoryview for efficient access.
+        """
+        start_time = time.time()
+        size = len(buffer)
+        
+        if size > SLOT_SIZE:
+            logger.error(f"Value size {size} exceeds slot size {SLOT_SIZE}")
+            raise ValueError(f"Value size {size} exceeds slot size {SLOT_SIZE}")
+
+        try:
+            key_str = key.to_string()
+            slot_offset, slot_idx = self._get_slot_offset(key)
+            
+            # Check if slot is already occupied by a different key
+            key_len, value_size = self._read_slot_metadata(slot_idx)
+            if key_len > 0 and value_size > 0:
+                stored_key = self._get_slot_key(slot_idx)
+                # Only warn if stored_key is valid (not None) and different from current key
+                # If stored_key is None, it means the slot metadata is invalid/corrupted,
+                # which can happen on first use with uninitialized DAX memory
+                if stored_key is not None and stored_key != key_str:
+                    logger.warning(f"Slot {slot_idx} collision: key {key_str} vs stored {stored_key}")
+                    # Overwrite the slot (simple eviction)
+            
+            # Write metadata
+            self._write_slot_metadata(slot_idx, len(key_str), size)
+            
+            # Write key at the beginning of slot (for verification)
+            key_bytes = key_str.encode("utf-8")
+            self.mmap_obj[slot_offset : slot_offset + len(key_bytes)] = key_bytes
+            
+            # Write value data
+            data_offset = slot_offset + len(key_bytes)
+            
+            # Check bounds
+            if data_offset + size > len(self.mmap_obj):
+                logger.error(f"Write offset {data_offset} + size {size} exceeds mmap size {len(self.mmap_obj)}")
+                raise ValueError("Write exceeds mmap bounds")
+            
+            # Use memoryview for efficient access to source buffer
+            # Convert buffer to memoryview if it's not already
+            if isinstance(buffer, memoryview):
+                buffer_mv = buffer
+            else:
+                buffer_mv = memoryview(buffer)
+            
+            # Write to mmap using slice assignment
+            # For DAX devices, slice assignment directly writes to CXL memory
+            try:
+                self.mmap_obj[data_offset : data_offset + size] = buffer_mv[:size]
+            except (OSError, ValueError, TypeError) as e:
+                # If direct slice assignment fails, try writing in smaller chunks
+                # Also handle case where memoryview slice assignment doesn't work
+                chunk_size = 4096  # 4KB chunks
+                try:
+                    # Convert to bytes for chunked write if needed
+                    buffer_bytes = bytes(buffer_mv[:size]) if isinstance(buffer_mv, memoryview) else buffer
+                    for i in range(0, size, chunk_size):
+                        chunk_end = min(i + chunk_size, size)
+                        self.mmap_obj[data_offset + i : data_offset + chunk_end] = buffer_bytes[i:chunk_end]
+                except (OSError, ValueError) as e2:
+                    logger.error(f"Failed to write to DAX device at offset {data_offset}: {e2}")
+                    raise e from e2
+            
+            # Flush to ensure persistence (may fail on DAX devices, that's okay)
+            slot_metadata_offset = self._get_slot_metadata_offset(slot_idx)
+            try:
+                self.mmap_obj.flush(slot_metadata_offset, SLOT_METADATA_SIZE + SLOT_SIZE)
+            except OSError:
+                # Flush failure is acceptable for DAX devices as writes are already persistent
+                pass
+
+            cxl_write_time = time.time() - start_time
+            logger.debug(
+                f"CXL write size: {size} bytes, "
+                f"Bandwidth: {size / cxl_write_time / 1e6:.2f} MB/s"
+            )
+        except Exception as e:
+            logger.error(f"Error writing to CXL: {e}", exc_info=True)
+            raise
+
+    def read_cxl_mmap(self, key: CacheEngineKey, buffer: bytearray):
+        """
+        Read buffer from CXL memory using slot-based structure.
+        This is used when we need to copy data to a DRAM buffer (e.g., for prefetch).
+        For direct access, use load_bytes_from_cxl instead.
+        """
+        start_time = time.time()
+        size = len(buffer)
+
+        try:
+            key_str = key.to_string()
+            slot_offset, slot_idx = self._get_slot_offset(key)
+            
+            # Read metadata
+            key_len, value_size = self._read_slot_metadata(slot_idx)
+            if key_len == 0 or value_size == 0:
+                raise ValueError(f"Slot {slot_idx} is empty")
+            
+            # Verify key matches
+            stored_key = self._get_slot_key(slot_idx)
+            if stored_key != key_str:
+                raise ValueError(f"Key mismatch: expected {key_str}, got {stored_key}")
+            
+            if value_size != size:
+                raise ValueError(f"Size mismatch: expected {size}, got {value_size}")
+
+            # Read data from slot (skip key, read value)
+            key_len_bytes = len(key_str.encode("utf-8"))
+            data_offset = slot_offset + key_len_bytes
+            
+            # Read from mmap using memoryview for efficient access
+            # Use memoryview to avoid creating intermediate bytes object
+            mmap_mv = memoryview(self.mmap_obj[data_offset : data_offset + value_size])
+            
+            # Copy to buffer using numpy (still need copy for DRAM buffer)
+            mmap_np = np.frombuffer(mmap_mv, dtype=np.uint8)
+            buffer_np = np.frombuffer(buffer, dtype=np.uint8)
+            np.copyto(buffer_np[:value_size], mmap_np)
+
+            cxl_read_time = time.time() - start_time
+            logger.debug(
+                f"CXL read size: {size} bytes, "
+                f"Bandwidth: {size / cxl_read_time / 1e6:.2f} MB/s"
+            )
+        except Exception as e:
+            logger.error(f"Error reading from CXL: {e}", exc_info=True)
+            with self.cxl_lock:
+                if key in self.dict:
+                    self.dict.pop(key)
+            raise
+
+    def close(self) -> None:
+        # Flush and close mmap
+        if hasattr(self, "mmap_obj") and self.mmap_obj:
+            try:
+                self.mmap_obj.flush()
+                self.mmap_obj.close()
+            except Exception as e:
+                logger.warning(f"Error closing mmap: {e}")
+
+        # Close file descriptor
+        if hasattr(self, "dax_fd"):
+            try:
+                os.close(self.dax_fd)
+            except Exception as e:
+                logger.warning(f"Error closing dax_fd: {e}")
+
+        self.cxl_worker.close()

@@ -272,6 +272,10 @@ class StorageManager:
         self._freeze_lock = threading.RLock()
 
         self._setup_metrics()
+        
+        # Initialize cache migration service if enabled
+        self.cache_migration_service = None
+        self._init_cache_migration_service()
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -303,6 +307,54 @@ class StorageManager:
         if not self.enable_pd and self.config.enable_async_loading:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
+
+    def _init_cache_migration_service(self) -> None:
+        """Initialize cache migration service if configured."""
+        extra_config = self.config.extra_config
+        if extra_config is None:
+            return
+            
+        enable_migration = extra_config.get("enable_cache_migration", False)
+        if not enable_migration:
+            return
+            
+        # Get source and target backends
+        source_backend_name = extra_config.get("cache_migration_source_backend", "LocalCPUBackend")
+        target_backend_name = extra_config.get("cache_migration_target_backend", "LocalDiskBackend")
+        
+        source_backend = self.storage_backends.get(source_backend_name)
+        target_backend = self.storage_backends.get(target_backend_name)
+        
+        if source_backend is None or target_backend is None:
+            logger.warning(
+                f"Cache migration enabled but backends not found: "
+                f"source={source_backend_name}, target={target_backend_name}. "
+                f"Available backends: {list(self.storage_backends.keys())}"
+            )
+            return
+            
+        # Import here to avoid circular dependency
+        from lmcache.v1.storage_backend.cache_migration_service import (
+            CacheMigrationService,
+        )
+        
+        top_n = extra_config.get("cache_migration_top_n", 10)
+        migration_interval = extra_config.get("cache_migration_interval", 60.0)
+        copy_mode = extra_config.get("cache_migration_copy_mode", True)
+        
+        self.cache_migration_service = CacheMigrationService(
+            source_backend=source_backend,
+            target_backend=target_backend,
+            top_n=top_n,
+            migration_interval=migration_interval,
+            copy_mode=copy_mode,
+        )
+        
+        logger.info(
+            f"Cache migration service initialized: "
+            f"source={source_backend_name}, target={target_backend_name}, "
+            f"top_n={top_n}, interval={migration_interval}s, copy_mode={copy_mode}"
+        )
 
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
@@ -1030,6 +1082,10 @@ class StorageManager:
 
     def close(self):
         logger.info("Closing StorageManager...")
+
+        # Stop migration service if enabled
+        if self.cache_migration_service is not None:
+            self.cache_migration_service.stop()
 
         # Close all backends
         for name, backend in self.storage_backends.items():

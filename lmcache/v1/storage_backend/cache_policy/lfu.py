@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import Any
+from typing import Any, Dict
 
 # Third Party
 from sortedcontainers import SortedDict
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.utils import CacheEngineKey
 from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy, KeyType
 
 logger = init_logger(__name__)
+
+KeyType = CacheEngineKey
 
 
 class LFUCachePolicy(BaseCachePolicy[KeyType, dict[KeyType, Any]]):
@@ -103,3 +106,24 @@ class LFUCachePolicy(BaseCachePolicy[KeyType, dict[KeyType, Any]]):
                 self.freq_to_keys.pop(freq)
 
         return evict_keys
+
+    def get_access_count(self, key: KeyType) -> int:
+        """
+        Get the access count (frequency) for a given key.
+        
+        Args:
+            key: The cache key
+            
+        Returns:
+            The frequency (access count) of this key
+        """
+        return self.key_to_freq.get(key, 0)
+    
+    def get_all_access_counts(self) -> Dict[KeyType, int]:
+        """
+        Get access counts (frequencies) for all keys.
+        
+        Returns:
+            A dictionary mapping keys to their frequencies
+        """
+        return self.key_to_freq.copy()

@@ -13,6 +13,7 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.cxl_backend import CxlBackend
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
@@ -201,6 +202,18 @@ def CreateStorageBackends(
         )
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
+
+    # Create CXL backend if configured
+    if extra_config is not None and extra_config.get("cxl_dax_device") is not None:
+        cxl_backend = CxlBackend(
+            config,
+            loop,
+            local_cpu_backend,
+            dst_device,
+            lmcache_worker,
+        )
+        backend_name = str(cxl_backend)
+        storage_backends[backend_name] = cxl_backend
 
     if not config.enable_pd or config.local_cpu:
         # Load storage backends from configuration

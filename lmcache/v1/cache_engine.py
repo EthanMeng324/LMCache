@@ -408,13 +408,10 @@ class LMCacheEngine:
                         start,
                         end,
                     )
-                    if isinstance(tokens, torch.Tensor):
-                        stored_event.medium = tokens.device
+                    # if isinstance(tokens, torch.Tensor):
+                    #     stored_event.medium = tokens.device
                 elif hashes is not None:
                     stored_event.token_ids = hashes[start : end + 1]
-                logger.debug(
-                    f"Added kv cache event '{stored_event}' to kv cache events queue"
-                )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
@@ -456,6 +453,7 @@ class LMCacheEngine:
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[None, None, None]:
+        logger.info(f"LMCacheEngine.store_layer() called: kv_events_enabled={self.kv_events_enabled}, tokens is not None={tokens is not None}")
         """
         Store the KV cache in a layerwise manner.
 
@@ -560,10 +558,10 @@ class LMCacheEngine:
                         start,
                         end,
                     )
-                    if isinstance(tokens, torch.Tensor):
-                        stored_event.medium = tokens.device
-                logger.debug(
-                    f"Added kv cache event '{stored_event}' to kv cache events queue"
+                    # if isinstance(tokens, torch.Tensor):
+                    #     stored_event.medium = tokens.device
+                logger.info(
+                    f"Added kv cache event with medium='{stored_event.medium}' to kv cache events queue: {stored_event}"
                 )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash

@@ -1,0 +1,53 @@
+# LMCache Configuration with Cache Migration Enabled
+# This configuration enables automatic migration of hot KV cache from CPU to disk
+
+# Basic configuration
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 2.0  # 2GB CPU cache
+# local_disk: "/tmp/lmcache_test"  # Disk cache directory - change this to your preferred path
+# max_local_disk_size: 10.0  # 10GB disk cache
+
+# Cache policy - must be LRU or LFU for access tracking
+cache_policy: "LRU"  # Options: "LRU", "LFU"
+
+# Enable KV cache events for debugging
+enable_kv_events: true
+
+# Save unfull chunks (chunks smaller than chunk_size)
+# This allows saving KV cache even when token count < chunk_size
+save_unfull_chunk: true
+
+# Enable cache migration
+extra_config:
+  # Enable the migration feature
+  enable_cache_migration: false
+  
+  # Source backend (where to migrate from)
+  cache_migration_source_backend: "LocalCPUBackend"
+  
+  # Target backend (where to migrate to)
+  cache_migration_target_backend: "CxlBackend"
+  
+  # Number of top accessed keys to migrate
+  cache_migration_top_n: 5
+  
+  # Minimum interval between migrations (in seconds)
+  # Migration only happens when this interval has passed AND new cache is stored
+  cache_migration_interval: 30.0
+  
+  # Copy mode: if true, keep original in source (copy to target)
+  # If false, move it (delete from source, add to target)
+  cache_migration_copy_mode: true
+  
+  # CXL Backend Configuration
+  # DAX device path (character device, e.g., /dev/dax1.0)
+  # Can also be set via environment variable: LMCACHE_CXL_DAX_DEVICE
+  cxl_dax_device: "/dev/dax0.0"
+  
+  # Maximum CXL cache size in GB (for eviction tracking)
+  # If not set or 0, uses the full device size
+  max_cxl_size: 64.0
+  
+  # Note: Device size can be set via environment variable:
+  # export LMCACHE_CXL_DAX_DEVICE_SIZE=8589934592  # 8GB in bytes
