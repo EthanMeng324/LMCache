@@ -47,13 +47,17 @@ class CxlShmObjMeta(Structure):
     _fields_ = [
         ("name", c_char * CXL_SHM_ONAME_LEN),  # CXL_SHM_ONAME_LEN = 20
         ("offset", c_uint64),  # cxl_shm_obj_offset_t
-        ("size", c_uint64),    # cxl_shm_obj_size_t
+        ("size", c_uint64),    # allocated size (bytes)
+        ("actual_size", c_uint64),  # logical payload size (bytes)
         ("in_use", ctypes.c_uint8),  # uint8_t (changed from int)
     ]
     
     def __repr__(self):
         name_str = self.name.decode('utf-8', errors='ignore').rstrip('\x00')
-        return f"CxlShmObjMeta(name='{name_str}', offset={self.offset}, size={self.size}, in_use={self.in_use})"
+        return (
+            f"CxlShmObjMeta(name='{name_str}', offset={self.offset}, "
+            f"size={self.size}, actual_size={getattr(self, 'actual_size', None)}, in_use={self.in_use})"
+        )
 
 
 class CxlShmHnd(Structure):
@@ -81,7 +85,7 @@ _lib.cxl_shm_init.restype = c_int
 _lib.cxl_shm_finalize.argtypes = []
 _lib.cxl_shm_finalize.restype = c_int
 
-_lib.cxl_shm_create.argtypes = [c_char_p, c_size_t, POINTER(CxlShmHnd)]
+_lib.cxl_shm_create.argtypes = [c_char_p, c_size_t, c_size_t, POINTER(CxlShmHnd)]
 _lib.cxl_shm_create.restype = c_int
 
 _lib.cxl_shm_open_obj.argtypes = [c_char_p, POINTER(CxlShmHnd)]
@@ -95,6 +99,28 @@ _lib.cxl_shm_destroy_from_hnd.restype = c_int
 
 _lib.clflush_region_with_mfence.argtypes = [c_void_p, c_size_t]
 _lib.clflush_region_with_mfence.restype = c_int
+
+# Debug APIs
+_lib.cxl_shm_reset_metadata.argtypes = []
+_lib.cxl_shm_reset_metadata.restype = c_int
+
+_lib.cxl_shm_debug_count_in_use.argtypes = [
+    POINTER(c_uint64),  # reachable_in_use
+    POINTER(c_uint64),  # reachable_max
+    POINTER(c_uint64),  # total_in_use
+    POINTER(c_uint64),  # total_max
+    POINTER(c_uint64),  # curr_offset
+    POINTER(c_uint32),  # bucket_levels
+]
+_lib.cxl_shm_debug_count_in_use.restype = c_int
+
+_lib.cxl_shm_debug_candidate_slots.argtypes = [
+    c_char_p,             # name
+    POINTER(c_uint32),    # out_idxs
+    POINTER(c_uint8),     # out_in_use
+    c_uint32,             # max_out
+]
+_lib.cxl_shm_debug_candidate_slots.restype = c_int
 
 
 class CxlShmWrapper:
@@ -127,20 +153,23 @@ class CxlShmWrapper:
             return result
         return 0
     
-    def create(self, name: str, size: int) -> Tuple[int, Optional[CxlShmHnd]]:
+    def create(self, name: str, size: int, actual_size: Optional[int] = None) -> Tuple[int, Optional[CxlShmHnd]]:
         """
         Create a shared memory object.
         
         Args:
             name: Object name
             size: Object size in bytes
+            actual_size: Logical payload size in bytes (<= size). Defaults to size.
             
         Returns:
             (return_code, handle) where return_code is 0 on success, -1 on failure
         """
         hnd = CxlShmHnd()
         name_bytes = name.encode('utf-8')
-        result = _lib.cxl_shm_create(name_bytes, size, ctypes.byref(hnd))
+        if actual_size is None:
+            actual_size = int(size)
+        result = _lib.cxl_shm_create(name_bytes, int(size), int(actual_size), ctypes.byref(hnd))
         if result == 0:
             return (0, hnd)
         return (result, None)
@@ -198,4 +227,50 @@ class CxlShmWrapper:
             0 on success
         """
         return _lib.clflush_region_with_mfence(addr, size)
+
+    def reset_metadata(self) -> int:
+        """Reset only metadata slots and allocation cursor (debug use)."""
+        return _lib.cxl_shm_reset_metadata()
+
+    def debug_count_in_use(self):
+        """Return tuple with (reachable_in_use, reachable_max, total_in_use, total_max, curr_offset, bucket_levels)."""
+        reachable_in_use = c_uint64(0)
+        reachable_max = c_uint64(0)
+        total_in_use = c_uint64(0)
+        total_max = c_uint64(0)
+        curr_offset = c_uint64(0)
+        bucket_levels = c_uint32(0)
+        rc = _lib.cxl_shm_debug_count_in_use(
+            ctypes.byref(reachable_in_use),
+            ctypes.byref(reachable_max),
+            ctypes.byref(total_in_use),
+            ctypes.byref(total_max),
+            ctypes.byref(curr_offset),
+            ctypes.byref(bucket_levels),
+        )
+        if rc != 0:
+            return None
+        return (
+            int(reachable_in_use.value),
+            int(reachable_max.value),
+            int(total_in_use.value),
+            int(total_max.value),
+            int(curr_offset.value),
+            int(bucket_levels.value),
+        )
+
+    def debug_candidate_slots(self, name: str, max_out: int = 32):
+        """Return list of (idx, in_use) for candidate slots of a name."""
+        idxs = (c_uint32 * max_out)()
+        in_use = (c_uint8 * max_out)()
+        rc = _lib.cxl_shm_debug_candidate_slots(
+            name.encode("utf-8"),
+            idxs,
+            in_use,
+            c_uint32(max_out),
+        )
+        if rc < 0:
+            return None
+        n = int(rc)
+        return [(int(idxs[i]), int(in_use[i])) for i in range(n)]
 

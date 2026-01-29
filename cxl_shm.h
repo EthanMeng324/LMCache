@@ -40,7 +40,10 @@ typedef struct {
 typedef struct {
     char name[CXL_SHM_ONAME_LEN];
     cxl_shm_obj_offset_t offset; // Offset within the DAX device
-    cxl_shm_obj_size_t size;   // Size of the memory object
+    // Allocated size (bytes) in the DAX mapping. This may be a padded/fixed size.
+    cxl_shm_obj_size_t size;
+    // Logical payload size (bytes) written by the caller (<= size).
+    cxl_shm_obj_size_t actual_size;
     uint8_t in_use;  // Flag indicating if the entry is used
 } cxl_shm_obj_meta_t;
  
@@ -48,7 +51,9 @@ typedef struct {
     // Simple spinlock for synchronization
     cxl_lock_t lock;
     volatile _Atomic int initialized;
-    uint32_t curr_offset;
+    // Allocation cursor within the DAX mapping.
+    // Must be 64-bit; otherwise it overflows at 4GB and causes data overlap.
+    uint64_t curr_offset;
 } cxl_shm_head_t;
 
 // Metadata region structure
@@ -71,7 +76,8 @@ typedef struct {
 int cxl_shm_init(int num_procs, int rank); 
 int cxl_shm_finalize();
 // Create a shared memory object
-int cxl_shm_create(const char *name, size_t size, cxl_shm_hnd_t *hnd);
+// `size` is allocated bytes; `actual_size` is logical payload bytes (<= size).
+int cxl_shm_create(const char *name, size_t size, size_t actual_size, cxl_shm_hnd_t *hnd);
 // Open an existing shared memory object
 int cxl_shm_open_obj(const char *name, cxl_shm_hnd_t *hnd);
 // Close a shared memory object handle
@@ -79,6 +85,25 @@ int cxl_shm_close(cxl_shm_hnd_t *hnd);
 // Destroy a shared memory object
 // int cxl_shm_destroy_from_name(const char *name);
 int cxl_shm_destroy_from_hnd(cxl_shm_hnd_t *hnd);
+
+// Debug utilities (best-effort; intended for testing/diagnosis)
+// Reset only metadata slots and allocator cursor (does NOT zero the whole DAX).
+// WARNING: This makes existing objects unreachable by name and may cause data overlap
+// if you continue allocating without a full device reset. Use only for debugging.
+int cxl_shm_reset_metadata();
+// Count how many slots are currently in_use.
+int cxl_shm_debug_count_in_use(uint64_t *reachable_in_use,
+                               uint64_t *reachable_max,
+                               uint64_t *total_in_use,
+                               uint64_t *total_max,
+                               uint64_t *curr_offset,
+                               uint32_t *bucket_levels);
+// For a given name, report the candidate slot indices (one per bucket level)
+// and whether each slot is in_use.
+int cxl_shm_debug_candidate_slots(const char *name,
+                                 uint32_t *out_idxs,
+                                 uint8_t *out_in_use,
+                                 uint32_t max_out);
 int cxl_release_lock(cxl_lock_t *lock, int my_id);
 int cxl_acquire_lock(cxl_lock_t *lock, int my_id);
 int cxl_acquire_smart_lock();

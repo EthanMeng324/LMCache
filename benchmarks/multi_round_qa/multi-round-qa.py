@@ -21,6 +21,10 @@ class WorkloadConfig:
     # Max number of users in the system concurrently
     num_users: int
 
+    # Total number of user sessions to run before exiting.
+    # If None, keep generating new users until interrupted or --time is reached.
+    total_users: Optional[int]
+
     # Length of shared system prompt
     system_prompt_len: int
 
@@ -208,6 +212,26 @@ class UserSession:
 
         self.finished = False
 
+    def set_initial_delay(self, delay_seconds: float, timestamp: float):
+        """
+        Stagger the first request so we don't burst all users at once.
+        delay_seconds is the delay until the first request is launched.
+        """
+        assert len(self.chat_history) == 0, (
+            "Initial delay should be set before the first request"
+        )
+        assert self.question_id == 0, "Initial delay should be set before any rounds"
+
+        if delay_seconds <= 0:
+            # Launch immediately on next step.
+            self.last_request_time = None
+            return
+
+        gap = self.user_config.gap_between_requests
+        # Make the first request happen after `delay_seconds` by setting
+        # last_request_time such that (now - last_request_time) <= gap until then.
+        self.last_request_time = timestamp - (gap - delay_seconds)
+
     def _update_result(self, response: Response):
         self.prompt_lengths.append(response.prompt_tokens)
         self.generation_lengths.append(response.generation_tokens)
@@ -355,6 +379,7 @@ class UserSessionManager:
     ):
         self.workload_config = workload_config
         self.sessions: list[UserSession] = []
+        self.total_users_created = 0
 
         gap_between_requests_per_user = workload_config.num_users / workload_config.qps
         session_alive_time = gap_between_requests_per_user * (
@@ -384,6 +409,17 @@ class UserSessionManager:
             workload_config.enforce_strict_concurrent_users
         )
 
+    def is_done(self) -> bool:
+        """
+        Return True if we were asked to run a finite number of users and all of
+        them have finished.
+        """
+        if self.workload_config.total_users is None:
+            return False
+        return self.total_users_created >= self.workload_config.total_users and len(
+            self.sessions
+        ) == 0
+
     def _load_sharegpt_data(self):
         with open("ShareGPT.json", "r", encoding="utf-8") as file:
             self.sharegpt_data = json.load(file)
@@ -398,8 +434,26 @@ class UserSessionManager:
         )
 
     def _ramp_up(self, timestamp: float, ramp_up_time: float):
+        # If we are running a finite number of users, create up to the desired
+        # concurrency and stagger their first requests across one request period.
+        if self.workload_config.total_users is not None:
+            max_to_create = min(self.workload_config.num_users, self.workload_config.total_users)
+            gap_between_requests_per_user = (
+                self.workload_config.num_users / self.workload_config.qps
+            )
+            phase_step = gap_between_requests_per_user / max_to_create
+            for i in range(max_to_create):
+                new_session = self._create_user_session()
+                if new_session is None:
+                    break
+                new_session.set_initial_delay(i * phase_step, timestamp)
+            self.need_ramp_up = False
+            return
+
         for i in range(self.workload_config.num_users):
             new_session = self._create_user_session()
+            if new_session is None:
+                break
             offset = ramp_up_time - i * self.gap_between_users
             if offset < 0:
                 break
@@ -407,7 +461,13 @@ class UserSessionManager:
         self.need_ramp_up = False
 
     def _create_user_session(self):
+        if (
+            self.workload_config.total_users is not None
+            and self.total_users_created >= self.workload_config.total_users
+        ):
+            return None
         self.user_id += 1
+        self.total_users_created += 1
         user_config = UserConfig.new_user_config(self.user_id, self.workload_config)
         if self.use_sharegpt:
             user_session = UserSession(
@@ -430,6 +490,13 @@ class UserSessionManager:
         self.sessions = [s for s in self.sessions if not s.finished]
 
     def _can_join_user(self, timestamp: float) -> bool:
+        # No new user session if we've reached the requested total.
+        if (
+            self.workload_config.total_users is not None
+            and self.total_users_created >= self.workload_config.total_users
+        ):
+            return False
+
         # No new user session if gap_between_users time interval not meets
         if timestamp - self.last_user_join <= self.gap_between_users:
             return False
@@ -451,12 +518,13 @@ class UserSessionManager:
 
         # Check if can join new user session
         if self._can_join_user(timestamp):
-            self._create_user_session()
-            self.last_user_join = timestamp
-            logger.info(
-                f"Joined a new user {self.user_id}, "
-                f"now active users: {len(self.sessions)}"
-            )
+            new_session = self._create_user_session()
+            if new_session is not None:
+                self.last_user_join = timestamp
+                logger.info(
+                    f"Joined a new user {self.user_id}, "
+                    f"now active users: {len(self.sessions)}"
+                )
 
         for session in self.sessions:
             session.step(timestamp, executor)
@@ -471,13 +539,52 @@ class UserSessionManager:
         pending_queries: int = 0,
         config_qps: Optional[float] = None,
     ):
-        if start_time and end_time:
+        if start_time is not None and end_time is not None:
             launched_queries = len(
                 df.query(f"{start_time} <= launch_time <= {end_time}")
             )
             df = df.query(f"{start_time} <= finish_time <= {end_time}")
         else:
             launched_queries = len(df)
+
+        # If there are no finished requests in this window, still print a
+        # meaningful summary (especially when requests are long or staggered).
+        if start_time is not None and end_time is not None and df.empty:
+            total_time = max(0.0, end_time - start_time)
+            total_requests = launched_queries + pending_queries
+            actual_qps = (total_requests / total_time) if total_time > 0 else float("nan")
+            finished_qps = 0.0
+            average_prefill_speed = 0.0
+            average_generation_speed = 0.0
+            average_generation_speed_per_request = float("nan")
+            average_ttft = float("nan")
+
+            CSI = "\x1b["
+            RESET = CSI + "0m"
+            print("\n")
+            print("==================== Performance summary ======================")
+            print(f"  \033[33mConfig QPS: \033[32m{(config_qps or 0.0):.4f} reqs/s\033[0m\n")
+            print(f"  \033[33mActual QPS: \033[32m{actual_qps:.4f} reqs/s\033[0m\n")
+            print(f"  \033[33mProcessing speed: \033[32m{finished_qps:.4f} reqs/s\033[0m\n")
+            print(f"  \033[33mRequests on-the-fly: {pending_queries}\033[0m\n")
+            print(
+                "  \033[33mInput tokens per second: "
+                f"\033[32m{average_prefill_speed:.4f} tokens/s\033[0m\n"
+            )
+            print(
+                "  \033[33mOutput tokens per second: "
+                f"\033[32m{average_generation_speed:.4f} tokens/s\033[0m\n"
+            )
+            print(
+                "  \033[33mAverage generation throughput (per request): "
+                f"\033[32m{average_generation_speed_per_request} "
+                "tokens/req/s\033[0m\n"
+            )
+            print(f"  \033[33mAverage TTFT: \033[32m{average_ttft}{RESET}\n")
+            print(f"Time range: {start_time} - {end_time} ({total_time:.2f}s)")
+            print("===============================================================")
+            print("\n")
+            return df
 
         logger.debug(
             f"Launched queries: {launched_queries}, "
@@ -552,7 +659,13 @@ class UserSessionManager:
         pending_queries = len([s for s in self.sessions if s.has_unfinished_request])
         assert self.start_time is not None
         start_time = max(self.start_time, start_time)
-        end_time = min(end_time, df["finish_time"].max())
+        # If there are no finished requests since start_time (e.g. long gaps),
+        # clamp end_time to avoid negative/invalid windows.
+        max_finish = df["finish_time"].max()
+        if pd.isna(max_finish) or max_finish < start_time:
+            end_time = start_time
+        else:
+            end_time = min(end_time, max_finish)
         qps = self.workload_config.qps
 
         df = UserSessionManager.ProcessSummary(
@@ -581,6 +694,15 @@ def parse_arguments():
         type=int,
         required=True,
         help="Max number of users in the system concurrently",
+    )
+    parser.add_argument(
+        "--total-users",
+        type=int,
+        default=None,
+        help=(
+            "Total number of user sessions to run before exiting. "
+            "If omitted, keeps generating new users until interrupted or --time is reached."
+        ),
     )
     parser.add_argument(
         "--shared-system-prompt",
@@ -715,6 +837,7 @@ def main():
 
     workload_config = WorkloadConfig(
         num_users=args.num_users,
+        total_users=args.total_users,
         system_prompt_len=args.shared_system_prompt,
         user_info_len=args.user_history_prompt,
         answer_len=args.answer_len,
@@ -746,6 +869,12 @@ def main():
                 last_summary_time = time.time()
 
             if args.time is not None and time.time() - start_time > args.time:
+                break
+
+            if manager.is_done():
+                logger.info(
+                    "Reached --total-users target and all sessions finished; exiting."
+                )
                 break
 
     except KeyboardInterrupt:

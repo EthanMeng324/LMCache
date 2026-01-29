@@ -277,6 +277,81 @@ class StorageManager:
         self.cache_migration_service = None
         self._init_cache_migration_service()
 
+        # Storage write policy (write-through by default).
+        # write-through: store to all configured backends (current behavior).
+        # write-back: store only to L1 (LocalCPUBackend), spill to lower tiers on eviction.
+        self.storage_write_policy = "write_through"
+        if self.config.extra_config is not None:
+            self.storage_write_policy = self.config.extra_config.get(
+                "storage_write_policy", self.storage_write_policy
+            )
+        self._init_write_back_policy()
+
+    def _init_write_back_policy(self) -> None:
+        """Initialize write-back eviction spilling if configured."""
+        if self.storage_write_policy != "write_back":
+            return
+        if not getattr(self.config, "local_cpu", False):
+            logger.warning(
+                "storage_write_policy=write_back requested but local_cpu is disabled; "
+                "falling back to write_through"
+            )
+            self.storage_write_policy = "write_through"
+            return
+        if "LocalCPUBackend" not in self.storage_backends:
+            logger.warning(
+                "storage_write_policy=write_back requested but LocalCPUBackend not found; "
+                "falling back to write_through"
+            )
+            self.storage_write_policy = "write_through"
+            return
+
+        # Determine spill targets: either explicit list from extra_config, or
+        # all non-L1 backends excluding transient transfer backends.
+        spill_target_names: Optional[list[str]] = None
+        if self.config.extra_config is not None:
+            spill_target_names = self.config.extra_config.get("write_back_targets")
+
+        excluded = {"LocalCPUBackend", "PDBackend", "P2PBackend"}
+        spill_targets: list[tuple[str, StorageBackendInterface]] = []
+        missing_targets: list[str] = []
+        if spill_target_names is not None:
+            existing = set(self.storage_backends.keys())
+            missing_targets = [name for name in spill_target_names if name not in existing]
+            if missing_targets:
+                logger.warning(
+                    "storage_write_policy=write_back requested spill targets not found: %s. "
+                    "Available backends: %s",
+                    missing_targets,
+                    sorted(existing),
+                )
+        for name, backend in self.storage_backends.items():
+            if name in excluded:
+                continue
+            if spill_target_names is not None and name not in spill_target_names:
+                continue
+            spill_targets.append((name, backend))
+
+        if not spill_targets:
+            logger.warning(
+                "storage_write_policy=write_back enabled but no spill targets configured; "
+                "falling back to write_through"
+            )
+            self.storage_write_policy = "write_through"
+            return
+
+        from lmcache.v1.storage_backend.write_back_listener import (
+            WriteBackEvictionListener,
+        )
+
+        listener = WriteBackEvictionListener(spill_targets)
+        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+        local_cpu_backend.add_listener(listener)
+        logger.info(
+            "Enabled write-back policy: L1=LocalCPUBackend, spill_targets=%s",
+            [name for name, _ in spill_targets],
+        )
+
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
         if prometheus_logger is None:
@@ -449,9 +524,22 @@ class StorageManager:
             memory_objs,
         )
 
+        # write-back policy: if caller didn't specify a location, write only to
+        # the L1 hot cache. Lower tiers will be filled by eviction spilling.
+        # NOTE: If a transfer_spec is provided (e.g. disagg / p2p), we also
+        # include P2PBackend even in write-back mode.
+        write_back_mode = self.storage_write_policy == "write_back" and location is None
+
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
+            if write_back_mode and backend_name != "LocalCPUBackend":
+                # Preserve transfer backends when explicitly requested by the caller
+                # via transfer_spec (best-effort heuristic).
+                if transfer_spec is not None and backend_name == "P2PBackend":
+                    pass
+                else:
+                    continue
 
             allocator_backend = backend.get_allocator_backend()
             cname = get_backend_cname(allocator_backend)
@@ -464,7 +552,16 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            try:
+                backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            except Exception:
+                # Cache storage should be best-effort: never crash the engine due to a
+                # single backend failing to write.
+                logger.exception(
+                    "batched_put: backend %s failed to store %d objects; skipping",
+                    backend_name,
+                    len(ks),
+                )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:
@@ -491,7 +588,29 @@ class StorageManager:
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
                     assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.submit_put_task(key, memory_obj)
+                    # IMPORTANT:
+                    # Do NOT insert a foreign-allocator MemoryObj directly into LocalCPUBackend.
+                    # LocalCPUBackend assumes its cached objects are freed by its own allocator.
+                    # Instead, best-effort copy into a LocalCPUBackend-allocated object and cache that.
+                    try:
+                        if memory_obj.tensor is not None:
+                            cached_obj = local_cpu_backend.allocate(
+                                memory_obj.get_shape(),
+                                memory_obj.get_dtype(),
+                                fmt=memory_obj.meta.fmt,
+                                eviction=True,
+                                busy_loop=False,
+                            )
+                            if cached_obj is not None and cached_obj.tensor is not None:
+                                cached_obj.tensor.copy_(memory_obj.tensor, non_blocking=True)
+                                local_cpu_backend.submit_put_task(key, cached_obj)
+                                # Release our local ref; backend keeps its own.
+                                cached_obj.ref_count_down()
+                    except Exception:
+                        logger.exception(
+                            "get: failed to cache key %s into LocalCPUBackend; skipping",
+                            getattr(key, "chunk_hash", key),
+                        )
                 return memory_obj
 
         return None

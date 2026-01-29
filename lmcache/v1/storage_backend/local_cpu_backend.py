@@ -244,29 +244,70 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return True
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
-        if force:
-            self.cpu_lock.acquire()
-        if key not in self.hot_cache:
-            if force:
-                self.cpu_lock.release()
-            return False
+        # NOTE: Historically `force=False` skipped locking and policy update.
+        # That is risky under concurrency and leaks policy state (e.g., LRU access
+        # counts). LocalCPUBackend is in-process and should be thread-safe, so we
+        # always take the lock and always update policy state when we remove.
+        evicted_items: list[tuple[CacheEngineKey, MemoryObj]] = []
+        with self.cpu_lock:
+            memory_obj = self.hot_cache.pop(key, None)
+            if memory_obj is None:
+                return False
 
-        memory_obj = self.hot_cache.pop(key)
-        memory_obj.ref_count_down()
-
-        if force:
             self.cache_policy.update_on_force_evict(key)
-            self.cpu_lock.release()
+            evicted_items.append((key, memory_obj))
 
-        if self.batched_msg_sender is not None:
-            self.batched_msg_sender.add_kv_op(
-                op_type=OpType.EVICT,
-                key=key.chunk_hash,
-            )
-        # NOTE (Jiayi): This `return True` might not accurately reflect
-        # whether the key is removed from the actual memory because
-        # other backends might still (temporarily) hold the memory object.
+            if self.batched_msg_sender is not None:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.EVICT,
+                    key=key.chunk_hash,
+                )
+
+        # Notify outside the lock to avoid deadlocks / long critical sections.
+        #
+        # Important: keep the backend's ownership ref alive during the callback
+        # so listeners can safely inspect/copy from the MemoryObj. Listeners that
+        # need to retain the object asynchronously must take their own ref via
+        # ref_count_up()/ref_count_down().
+        self._notify_evict(evicted_items)
+        # Now release the backend's ownership ref (added in submit_put_task()).
+        for _, memory_obj in evicted_items:
+            memory_obj.ref_count_down()
         return True
+
+    def batched_remove(
+        self,
+        keys: list[CacheEngineKey],
+        force: bool = True,
+    ) -> int:
+        # Override base implementation so we can:
+        # 1) atomically remove multiple keys
+        # 2) notify eviction listeners once with (key, MemoryObj) pairs
+        evicted_items: list[tuple[CacheEngineKey, MemoryObj]] = []
+        num_removed = 0
+
+        with self.cpu_lock:
+            for key in keys:
+                memory_obj = self.hot_cache.pop(key, None)
+                if memory_obj is None:
+                    continue
+
+                self.cache_policy.update_on_force_evict(key)
+                evicted_items.append((key, memory_obj))
+                num_removed += 1
+
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.EVICT,
+                        key=key.chunk_hash,
+                    )
+
+        # Notify first (listeners may take their own refs), then drop the
+        # backend ownership refs.
+        self._notify_evict(evicted_items)
+        for _, memory_obj in evicted_items:
+            memory_obj.ref_count_down()
+        return num_removed
 
     def _calculate_effective_cpu_size(
         self,
@@ -474,25 +515,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # TODO(Jiayi): optimize `num_candidates` with estimation.
                 # Accurate estimation is hard due to fragmentation
                 num_candidates = 1
-                evict_keys = None
+                # NOTE: Pick eviction candidates under lock, but perform the
+                # actual removal outside the lock. LocalCPUBackend.remove/batched_remove
+                # will take the lock and may notify listeners; calling them while
+                # holding cpu_lock would deadlock.
+                evict_keys: list[CacheEngineKey] = []
                 with self.cpu_lock:
                     evict_keys = self.cache_policy.get_evict_candidates(
                         self.hot_cache, num_candidates=num_candidates
                     )
-                    if evict_keys:
-                        # we can continue trying to evict from the hot_cache
-                        # and don't need to wait for other requests yet
-                        wait_other_requests = False
-                        logger.debug(
-                            f"Evicting {len(evict_keys)} chunks from cpu memory"
-                        )
-                        # remove
-                        self.batched_remove(evict_keys, force=False)
-                        evict_keys_count += len(evict_keys)
-                    else:
-                        self.stats_monitor.update_local_cpu_evict_failed_count(
-                            num_candidates
-                        )
+
+                if evict_keys:
+                    # we can continue trying to evict from the hot_cache
+                    # and don't need to wait for other requests yet
+                    wait_other_requests = False
+                    logger.debug(f"Evicting {len(evict_keys)} chunks from cpu memory")
+                    self.batched_remove(evict_keys, force=False)
+                    evict_keys_count += len(evict_keys)
+                else:
+                    self.stats_monitor.update_local_cpu_evict_failed_count(num_candidates)
 
             if wait_other_requests:
                 if not busy_loop:

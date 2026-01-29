@@ -4,7 +4,7 @@
 # Basic configuration
 chunk_size: 256
 local_cpu: true
-max_local_cpu_size: 2.0  # 2GB CPU cache
+max_local_cpu_size: 32.0  # 2GB CPU cache
 # local_disk: "/tmp/lmcache_test"  # Disk cache directory - change this to your preferred path
 # max_local_disk_size: 10.0  # 10GB disk cache
 
@@ -17,6 +17,9 @@ enable_kv_events: true
 # Save unfull chunks (chunks smaller than chunk_size)
 # This allows saving KV cache even when token count < chunk_size
 save_unfull_chunk: true
+
+internal_api_server_enabled: true
+
 
 # Enable cache migration
 extra_config:
@@ -43,11 +46,18 @@ extra_config:
   # CXL Backend Configuration
   # DAX device path (character device, e.g., /dev/dax1.0)
   # Can also be set via environment variable: LMCACHE_CXL_DAX_DEVICE
-  cxl_dax_device: "/dev/dax0.0"
+  # NOTE: adjust to the DAX device present on your machine.
+  # Common examples: /dev/dax0.0 or /dev/dax1.0
+  cxl_dax_device: "/dev/dax1.0"
   
   # Maximum CXL cache size in GB (for eviction tracking)
   # If not set or 0, uses the full device size
-  max_cxl_size: 64.0
+  max_cxl_size: 30.0
   
   # Note: Device size can be set via environment variable:
   # export LMCACHE_CXL_DAX_DEVICE_SIZE=8589934592  # 8GB in bytes
+
+  storage_write_policy: write_back
+  write_back_targets: ["CxlBackend"] 
+
+  cxl_reset_on_init: metadata

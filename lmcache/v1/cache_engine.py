@@ -1469,7 +1469,12 @@ class LMCacheEngine:
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
                 if memory_obj is None:
                     logger.warning(
-                        "The cache block is in the storage, but it can't be retrieved"
+                        "The cache block is in the storage, but it can't be retrieved "
+                        "(location=%s, key=%s, start=%s, end=%s)",
+                        location,
+                        getattr(key, "chunk_hash", key),
+                        start,
+                        end,
                     )
                     if (
                         last_failed_block_start is None

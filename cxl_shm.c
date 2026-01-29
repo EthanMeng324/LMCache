@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cxl_shm.h"
 #include "mem_hash.h"
-#define CXL_SHM_DAX_SIZE (1UL << 35) // 32GB
+#define CXL_SHM_DAX_SIZE (1UL << 36) // 64GB
 #define CXL_SHM_DAX_PATH_DEFAULT "/dev/dax0.0"
 #define CACHELINE_SIZE 64
 
@@ -13,6 +13,7 @@ static int my_rank = 0;
 static int num_ranks = 0;
 static cxl_shm_lock_t *cxl_shm_lock = NULL;
 static char dax_path[256] = {0}; // Store DAX device path
+static int verbose_not_found = 0;
 
 // Spinlock functions
 static void acquire_lock(atomic_flag *lock) {
@@ -22,7 +23,7 @@ static void acquire_lock(atomic_flag *lock) {
 }
 static uint64_t str2hash(const char *str);
 static int find_meta_hash_idx(const char *name);
-static int find_avail_hash_idx(const char *name);
+static int find_avail_hash_idx(const char *name, uint64_t *out_offset);
 
 #define LOCK_TIMEOUT_NS 6000000000  // 6 second timeout
 
@@ -38,23 +39,23 @@ static void release_lock(atomic_flag *lock) {
     clflush_region_with_mfence(lock, sizeof (atomic_flag));
 }
 
-static int acquire_lock_with_timeout(atomic_flag *lock) {
-    struct timespec start, current;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+// static int acquire_lock_with_timeout(atomic_flag *lock) {
+//     struct timespec start, current;
+//     clock_gettime(CLOCK_MONOTONIC, &start);
     
-    clflush_region_with_mfence(lock, sizeof (atomic_flag));
-    while (atomic_flag_test_and_set(lock)) {
-        clock_gettime(CLOCK_MONOTONIC, &current);
-        if ((current.tv_sec - start.tv_sec) * 1000000000 + 
-            (current.tv_nsec - start.tv_nsec) > LOCK_TIMEOUT_NS) {
-            // release_lock(lock);
-            return -1;
-        }
-        clflush_region_with_mfence(lock, sizeof (atomic_flag));
-    }
-    clflush_region_with_mfence(lock, sizeof (atomic_flag));
-    return 0;
-}
+//     clflush_region_with_mfence(lock, sizeof (atomic_flag));
+//     while (atomic_flag_test_and_set(lock)) {
+//         clock_gettime(CLOCK_MONOTONIC, &current);
+//         if ((current.tv_sec - start.tv_sec) * 1000000000 + 
+//             (current.tv_nsec - start.tv_nsec) > LOCK_TIMEOUT_NS) {
+//             // release_lock(lock);
+//             return -1;
+//         }
+//         clflush_region_with_mfence(lock, sizeof (atomic_flag));
+//     }
+//     clflush_region_with_mfence(lock, sizeof (atomic_flag));
+//     return 0;
+// }
 
 // Export functions for Python binding
 __attribute__((visibility("default"))) int clflush_region_with_mfence(void *addr, size_t size) {
@@ -68,87 +69,87 @@ __attribute__((visibility("default"))) int clflush_region_with_mfence(void *addr
     return 0;
 }
 
-void clflush_region_with_sfence(void *addr, size_t size) {
-    uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
-    uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
-    do {
-        _mm_clflushopt((void*)p);
-        p += CACHELINE_SIZE;
-    } while (p < end);
-    _mm_sfence();
-}
+// void clflush_region_with_sfence(void *addr, size_t size) {
+//     uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+//     uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
+//     do {
+//         _mm_clflushopt((void*)p);
+//         p += CACHELINE_SIZE;
+//     } while (p < end);
+//     _mm_sfence();
+// }
 
-void clwb_region_with_barrier(void *addr, size_t size) {
-    uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
-    uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
-    do {
-        _mm_clwb((void*)p);
-        p += CACHELINE_SIZE;
-    } while (p < end);
-    _mm_mfence();
-}
+// void clwb_region_with_barrier(void *addr, size_t size) {
+//     uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+//     uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
+//     do {
+//         _mm_clwb((void*)p);
+//         p += CACHELINE_SIZE;
+//     } while (p < end);
+//     _mm_mfence();
+// }
 
-void clflush_region(void *addr, size_t size) {
-    uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
-    uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
-    do {
-        _mm_clflushopt((void*)p);
-        p += CACHELINE_SIZE;
-    } while (p < end);
-}
+// void clflush_region(void *addr, size_t size) {
+//     uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+//     uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
+//     do {
+//         _mm_clflushopt((void*)p);
+//         p += CACHELINE_SIZE;
+//     } while (p < end);
+// }
 
-void clwb_region(void *addr, size_t size) {
-    uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
-    uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
-    do {
-        _mm_clwb((void*)p);
-        p += CACHELINE_SIZE;
-    } while (p < end);
-}
+// void clwb_region(void *addr, size_t size) {
+//     uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+//     uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
+//     do {
+//         _mm_clwb((void*)p);
+//         p += CACHELINE_SIZE;
+//     } while (p < end);
+// }
 
-void debug_print_shm_head() {
-    const char *env_dax_path = getenv("LMCACHE_CXL_DAX_DEVICE");
-    const char *dax_device_path = env_dax_path ? env_dax_path : CXL_SHM_DAX_PATH_DEFAULT;
-    printf("Trying to open file: %s\n", dax_device_path);
+// void debug_print_shm_head() {
+//     const char *env_dax_path = getenv("LMCACHE_CXL_DAX_DEVICE");
+//     const char *dax_device_path = env_dax_path ? env_dax_path : CXL_SHM_DAX_PATH_DEFAULT;
+//     printf("Trying to open file: %s\n", dax_device_path);
     
-    int fd = open(dax_device_path, O_RDONLY);
-    if (fd < 0) {
-        perror("Failed to open shm file for debug");
-        return;
-    }
-    printf("File opened successfully, fd=%d\n", fd);
+//     int fd = open(dax_device_path, O_RDONLY);
+//     if (fd < 0) {
+//         perror("Failed to open shm file for debug");
+//         return;
+//     }
+//     printf("File opened successfully, fd=%d\n", fd);
 
-    void *debug_addr = mmap(NULL, 64, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
+//     void *debug_addr = mmap(NULL, 64, PROT_READ, MAP_SHARED, fd, 0);
+//     close(fd);
     
-    if (debug_addr == MAP_FAILED) {
-        perror("Failed to mmap for debug");
-        return;
-    }
-    printf("Memory mapped successfully at %p\n", debug_addr);
+//     if (debug_addr == MAP_FAILED) {
+//         perror("Failed to mmap for debug");
+//         return;
+//     }
+//     printf("Memory mapped successfully at %p\n", debug_addr);
 
-    unsigned char *buffer = (unsigned char *)debug_addr;
-    printf("First 64 bytes of shm file:\n");
+//     unsigned char *buffer = (unsigned char *)debug_addr;
+//     printf("First 64 bytes of shm file:\n");
     
-    for (size_t row = 0; row < 4; row++) {
-        printf("\n%04zx: ", row * 16);
-        for (size_t col = 0; col < 16; col++) {
-            size_t i = row * 16 + col;
-            printf("%02x ", buffer[i]);
-            fflush(stdout);
-        }
-        printf(" (row %zu complete)\n", row);
-        fflush(stdout);
-    }
-    printf("\nDebug print complete\n");
-    fflush(stdout);
+//     for (size_t row = 0; row < 4; row++) {
+//         printf("\n%04zx: ", row * 16);
+//         for (size_t col = 0; col < 16; col++) {
+//             size_t i = row * 16 + col;
+//             printf("%02x ", buffer[i]);
+//             fflush(stdout);
+//         }
+//         printf(" (row %zu complete)\n", row);
+//         fflush(stdout);
+//     }
+//     printf("\nDebug print complete\n");
+//     fflush(stdout);
 
-    if (munmap(debug_addr, 64) != 0) {
-        perror("Failed to munmap debug memory");
-    }
-    printf("Debug function finished\n");
-    fflush(stdout);
-}
+//     if (munmap(debug_addr, 64) != 0) {
+//         perror("Failed to munmap debug memory");
+//     }
+//     printf("Debug function finished\n");
+//     fflush(stdout);
+// }
 
  
 __attribute__((visibility("default"))) int cxl_shm_finalize() {
@@ -193,6 +194,12 @@ __attribute__((visibility("default"))) int cxl_shm_init(int num_procs, int rank)
     // Store the path for later use
     strncpy(dax_path, dax_device_path, sizeof(dax_path) - 1);
     dax_path[sizeof(dax_path) - 1] = '\0';
+
+    // Debug logging control:
+    // By default, treat "object not found" as a normal miss and do NOT spam stderr.
+    // Enable with: export LMCACHE_CXL_VERBOSE_NOT_FOUND=1
+    const char *env_verbose = getenv("LMCACHE_CXL_VERBOSE_NOT_FOUND");
+    verbose_not_found = (env_verbose && env_verbose[0] == '1') ? 1 : 0;
     
     int fd = open(dax_device_path, O_RDWR);
     if (fd < 0) {
@@ -240,7 +247,14 @@ __attribute__((visibility("default"))) int cxl_shm_init(int num_procs, int rank)
                 // Too slow for 128G shared memory, so comment it
                 // memset((char*)addr + sizeof(cxl_lock_t), 0, CXL_SHM_DAX_SIZE - sizeof(cxl_lock_t));
                 // clflush_region_with_mfence((char*)addr + sizeof(cxl_lock_t), CXL_SHM_DAX_SIZE - sizeof(cxl_lock_t));
-                meta->head.curr_offset = mh->total_size + 2 * sizeof(uint64_t) * num_procs;
+                // IMPORTANT:
+                // - The actual metadata region in memory is sizeof(cxl_shm_metadata_t),
+                //   which includes objs[CXL_SHM_MAX_OBJS].
+                // - mh->total_size only accounts for mh->max_node entries (hash-reachable),
+                //   which is smaller than CXL_SHM_MAX_OBJS. Using mh->total_size here would
+                //   place lock arrays / data region inside the tail of metadata and corrupt it.
+                uint64_t meta_region_size = (uint64_t)sizeof(cxl_shm_metadata_t);
+                meta->head.curr_offset = meta_region_size + 2ULL * sizeof(uint64_t) * (uint64_t)num_procs;
                 clflush_region_with_mfence(&meta->head.curr_offset, sizeof(meta->head.curr_offset));
                 atomic_store(&meta->head.initialized, 1);
                 clflush_region_with_mfence(&meta->head.initialized, sizeof(meta->head.initialized));
@@ -257,14 +271,17 @@ __attribute__((visibility("default"))) int cxl_shm_init(int num_procs, int rank)
     clflush_region_with_mfence(&meta->head, sizeof(cxl_shm_head_t));
     // Too slow for 128G shared memory, so comment it
     // clflush_region_with_mfence((char*)addr, CXL_SHM_DAX_SIZE);
-    cxl_shm_lock->level = (uint64_t *)((char *)dax_addr + mh->total_size + sizeof(uint64_t) * num_procs);
-    cxl_shm_lock->victim = (uint64_t *)((char *)dax_addr + mh->total_size + 2 * sizeof(uint64_t) * num_procs);
+    // Lock arrays live immediately after the full metadata region.
+    uint64_t meta_region_size = (uint64_t)sizeof(cxl_shm_metadata_t);
+    cxl_shm_lock->level = (uint64_t *)((char *)dax_addr + meta_region_size);
+    cxl_shm_lock->victim =
+        (uint64_t *)((char *)dax_addr + meta_region_size + sizeof(uint64_t) * num_procs);
 
     return 0;
 }
  
-// Create a shared memory object
-__attribute__((visibility("default"))) int cxl_shm_create(const char *name, size_t size, cxl_shm_hnd_t *hnd) {
+// Create a shared memory object (allocated `size`, logical `actual_size`)
+__attribute__((visibility("default"))) int cxl_shm_create(const char *name, size_t size, size_t actual_size, cxl_shm_hnd_t *hnd) {
     if (!name || !hnd) return -1;
 
     // struct timeval tv;
@@ -278,7 +295,7 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
         return -1;
     }
  
-    clflush_region_with_mfence(&meta->objs, sizeof(meta->objs));
+    // clflush_region_with_mfence(&meta->objs, sizeof(meta->objs));
     int idx = find_meta_hash_idx(name);
     if (idx != -1) {
         fprintf(stderr, "Object with name '%s' already exists\n", name);
@@ -288,7 +305,8 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
     }
  
     // Find a free slot
-    int free_idx = find_avail_hash_idx(name);
+    uint64_t reused_offset = 0;
+    int free_idx = find_avail_hash_idx(name, &reused_offset);
     if (free_idx == -1) {
         fprintf(stderr, "No free slots available for shared objects\n");
         // cxl_release_lock(&meta->head.lock, my_pid);
@@ -296,27 +314,37 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
         return -1;
     }
  
-    // Simple allocation: find the end of allocated space
+    // Decide offset:
+    // - if reused_offset == 0 => allocate from curr_offset (old behavior)
+    // - else => reuse the existing offset for this free slot
     clflush_region_with_mfence(&meta->head, sizeof(meta->head));
     uint64_t current_offset = meta->head.curr_offset;
     current_offset = align_to_cacheline(current_offset);
+    uint64_t obj_offset = reused_offset ? reused_offset : current_offset;
  
-    // Check if enough space is available
-    size_t dax_size = CXL_SHM_DAX_SIZE; 
-    if (current_offset + size > dax_size) {
-        fprintf(stderr, "Not enough space in DAX device, device size %zu, data size: %zu, current_offset: %lu, meta->head.curr_offset: %u \n", dax_size, size, current_offset, meta->head.curr_offset);
-        // cxl_release_lock(&meta->head.lock, my_pid);
-        cxl_release_smart_lock();
-        abort();
-        return -1;
+    // Only need to check remaining space when we extend from curr_offset.
+    // For reused_offset != 0, caller guarantees the offset is valid.
+    if (reused_offset == 0) {
+        size_t dax_size = CXL_SHM_DAX_SIZE;
+        if (obj_offset + size > dax_size) {
+            fprintf(stderr, "Not enough space in DAX device, device size %zu, data size: %zu, obj_offset: %lu, meta->head.curr_offset: %lu \n", dax_size, size, obj_offset, meta->head.curr_offset);
+            // cxl_release_lock(&meta->head.lock, my_pid);
+            cxl_release_smart_lock();
+            abort();
+            return -1;
+        }
     }
  
     // Initialize the shared object metadata
     cxl_shm_obj_meta_t *obj = &meta->objs[free_idx];
     strncpy(obj->name, name, CXL_SHM_ONAME_LEN - 1);
     obj->name[CXL_SHM_ONAME_LEN - 1] = '\0';
-    obj->offset = current_offset;
+    obj->offset = obj_offset;
     obj->size = size;
+    if (actual_size > size) {
+        actual_size = size;
+    }
+    obj->actual_size = actual_size;
     obj->in_use = 1;
     clflush_region_with_mfence(obj, sizeof(cxl_shm_obj_meta_t));
  
@@ -324,7 +352,9 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
     hnd->obj = obj;
     hnd->mapped_addr = (char *)dax_addr + obj->offset;
 
-    meta->head.curr_offset = current_offset + size;
+    if (reused_offset == 0) {
+        meta->head.curr_offset = current_offset + (uint64_t)size;
+    }
     clflush_region_with_mfence(&meta->head, sizeof(meta->head));
  
     // cxl_release_lock(&meta->head.lock, my_pid);
@@ -342,10 +372,12 @@ __attribute__((visibility("default"))) int cxl_shm_open_obj(const char *name, cx
         return -1;
     }
 
-    clflush_region_with_mfence(&meta->objs, sizeof(meta->objs));
+    // clflush_region_with_mfence(&meta->objs, sizeof(meta->objs));
     int idx = find_meta_hash_idx(name);
     if (idx == -1) {
-        fprintf(stderr, "Shared object '%s' not found\n", name);
+        if (verbose_not_found) {
+            fprintf(stderr, "Shared object '%s' not found\n", name);
+        }
         // cxl_release_lock(&meta->head.lock, my_pid);
         cxl_release_smart_lock();
         return -1;
@@ -354,7 +386,7 @@ __attribute__((visibility("default"))) int cxl_shm_open_obj(const char *name, cx
     found = &meta->objs[idx];
     hnd->obj = found;
     hnd->mapped_addr = (char *)dax_addr + found->offset;
-    clflush_region_with_mfence(hnd->mapped_addr, found->size);
+    // clflush_region_with_mfence(hnd->mapped_addr, found->size);
     // cxl_release_lock(&meta->head.lock, my_pid);
     cxl_release_smart_lock();
  
@@ -372,6 +404,92 @@ __attribute__((visibility("default"))) int cxl_shm_close(cxl_shm_hnd_t *hnd) {
     hnd->mapped_addr = NULL;
  
     return 0;
+}
+
+// -----------------------
+// Debug / diagnostic APIs
+// -----------------------
+__attribute__((visibility("default"))) int cxl_shm_reset_metadata() {
+    if (!meta || !mh) return -1;
+    if (cxl_acquire_smart_lock()) {
+        fprintf(stderr, "cxl_shm_reset_metadata failed to acquire the lock\n");
+        return -1;
+    }
+
+    // Reset object metadata slots. We reset the whole declared array to be safe.
+    memset(meta->objs, 0, sizeof(meta->objs));
+    clflush_region_with_mfence(meta->objs, sizeof(meta->objs));
+
+    // Reset allocation cursor to the initial offset computed in init.
+    // Layout is: [sizeof(cxl_shm_metadata_t)][level][victim][data]
+    uint64_t meta_region_size = (uint64_t)sizeof(cxl_shm_metadata_t);
+    meta->head.curr_offset =
+        meta_region_size + (2ULL * sizeof(uint64_t) * (uint64_t)num_ranks);
+    clflush_region_with_mfence(&meta->head.curr_offset, sizeof(meta->head.curr_offset));
+
+    cxl_release_smart_lock();
+    return 0;
+}
+
+__attribute__((visibility("default"))) int cxl_shm_debug_count_in_use(
+    uint64_t *reachable_in_use,
+    uint64_t *reachable_max,
+    uint64_t *total_in_use,
+    uint64_t *total_max,
+    uint64_t *curr_offset,
+    uint32_t *bucket_levels)
+{
+    if (!meta || !mh) return -1;
+
+    uint64_t rin = 0;
+    uint64_t tin = 0;
+
+    // Reachable range: indices used by hashing (mh->max_node).
+    for (uint32_t i = 0; i < mh->max_node; i++) {
+        // Best-effort flush before read
+        clflush_region_with_mfence(&meta->objs[i], sizeof(cxl_shm_obj_meta_t));
+        if (meta->objs[i].in_use) rin++;
+    }
+
+    // Total range: full metadata table (CXL_SHM_MAX_OBJS).
+    for (uint32_t i = 0; i < CXL_SHM_MAX_OBJS; i++) {
+        clflush_region_with_mfence(&meta->objs[i], sizeof(cxl_shm_obj_meta_t));
+        if (meta->objs[i].in_use) tin++;
+    }
+
+    if (reachable_in_use) *reachable_in_use = rin;
+    if (reachable_max) *reachable_max = mh->max_node;
+    if (total_in_use) *total_in_use = tin;
+    if (total_max) *total_max = CXL_SHM_MAX_OBJS;
+    if (curr_offset) {
+        clflush_region_with_mfence(&meta->head.curr_offset, sizeof(meta->head.curr_offset));
+        *curr_offset = (uint64_t)meta->head.curr_offset;
+    }
+    if (bucket_levels) *bucket_levels = mh->bucket_levels;
+    return 0;
+}
+
+__attribute__((visibility("default"))) int cxl_shm_debug_candidate_slots(
+    const char *name,
+    uint32_t *out_idxs,
+    uint8_t *out_in_use,
+    uint32_t max_out)
+{
+    if (!meta || !mh || !name || !out_idxs || !out_in_use) return -1;
+    uint64_t key = str2hash(name);
+    uint32_t base_pos = 0;
+    uint32_t out_n = 0;
+
+    for (uint32_t i = 0; i < mh->bucket_levels; i++) {
+        if (out_n >= max_out) break;
+        if (i > 0) base_pos += mh->bucket[i - 1];
+        uint32_t idx = base_pos + (uint32_t)(key % mh->bucket[i]);
+        clflush_region_with_mfence(&meta->objs[idx], sizeof(cxl_shm_obj_meta_t));
+        out_idxs[out_n] = idx;
+        out_in_use[out_n] = meta->objs[idx].in_use ? 1 : 0;
+        out_n++;
+    }
+    return (int)out_n;
 }
  
 // // Destroy a shared memory object
@@ -415,9 +533,12 @@ __attribute__((visibility("default"))) int cxl_shm_destroy_from_hnd(cxl_shm_hnd_
     clflush_region_with_mfence(mapped_addr, hnd->obj->size);
 
     // Clear the metadata
+    // Mark slot free but keep offset (and size) so future create() can reuse it.
+    // This enables reuse-after-destroy without growing curr_offset indefinitely.
     hnd->obj->in_use = 0;
-    memset(hnd->obj, 0, sizeof(cxl_shm_obj_meta_t));
-    clflush_region_with_mfence(hnd->obj,  sizeof(cxl_shm_obj_meta_t));
+    memset(hnd->obj->name, 0, CXL_SHM_ONAME_LEN);
+    hnd->obj->actual_size = 0;
+    clflush_region_with_mfence(hnd->obj, sizeof(cxl_shm_obj_meta_t));
 
 
     // close handle
@@ -444,6 +565,7 @@ static int find_meta_hash_idx(const char *name) {
 	for (uint32_t i = 0; i < mh->bucket_levels; i++) {
 		if (i > 0) base_pos += mh->bucket[i-1];
 		idx =  base_pos + (key % mh->bucket[i]);
+        clflush_region_with_mfence(&meta->objs[idx], sizeof(cxl_shm_obj_meta_t));
         if (meta->objs[idx].in_use && strncmp(meta->objs[idx].name, name, CXL_SHM_ONAME_LEN) == 0) {
            return idx;
         }
@@ -451,14 +573,16 @@ static int find_meta_hash_idx(const char *name) {
     return -1;
 }
 
-static int find_avail_hash_idx(const char *name) {
+static int find_avail_hash_idx(const char *name, uint64_t *out_offset) {
     int idx = -1;
     uint32_t base_pos = 0;
     uint64_t key = str2hash(name);
 	for (uint32_t i = 0; i < mh->bucket_levels; i++) {
 		if (i > 0) base_pos += mh->bucket[i-1];
 		idx =  base_pos + (key % mh->bucket[i]);
+        clflush_region_with_mfence(&meta->objs[idx], sizeof(cxl_shm_obj_meta_t));
         if (!meta->objs[idx].in_use) {
+           if (out_offset) *out_offset = (uint64_t)meta->objs[idx].offset;
            return idx;
         }
 	}

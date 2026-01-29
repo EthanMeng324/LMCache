@@ -17,6 +17,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.storage_backend.storage_backend_listener import StorageBackendListener
 
 if TYPE_CHECKING:
     # First Party
@@ -42,6 +43,34 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
             raise
 
         self.dst_device = dst_device
+        self._listeners: list[StorageBackendListener] = []
+
+    def add_listener(self, listener: StorageBackendListener) -> None:
+        """Register a listener for backend events (e.g., eviction)."""
+        self._listeners.append(listener)
+
+    def remove_listener(self, listener: StorageBackendListener) -> None:
+        """Unregister a previously registered listener."""
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _notify_evict(self, items: list[tuple[CacheEngineKey, MemoryObj]]) -> None:
+        """Notify listeners that items were evicted.
+
+        Backends should call this *after* removing the items from their own
+        index/metadata, but while `MemoryObj`s are still valid.
+        """
+        if not items or not self._listeners:
+            return
+        for listener in list(self._listeners):
+            try:
+                listener.on_evict(self, items)
+            except Exception:
+                # Best-effort: never let a listener crash the backend.
+                # Avoid importing logger here to keep module dependencies minimal.
+                pass
 
     @abc.abstractmethod
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
