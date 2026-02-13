@@ -794,8 +794,8 @@ class StorageManager:
             Then cum_chunk_lengths = [0, 256, 512, 640]
             Note: len(cum_chunk_lengths) = len(keys) + 1
         :param Optional[list[str]] search_range: The range of storage backends
-        to search in. Should be a subset of ["LocalCPUBackend",
-        "LocalDiskBackend"] for now. If None, search in all backends.
+        to search in. Common values include ["LocalCPUBackend", "CxlBackend",
+        "LocalDiskBackend"]. If None, search in all active backends.
         :param bool pin: Whether to pin the keys.
         """
 

@@ -70,8 +70,10 @@ python3 benchmarks/multi_round_qa/multi-round-qa.py \
   --base-url http://localhost:8000/v1
 
 输出diff
+
+BASE=HEAD~2
 (
-  git diff -- . ':(exclude)*.md' ':(exclude)*.o'
+  git diff "$BASE" -- . ':(exclude)*.md' ':(exclude)*.o'
   echo
   git ls-files --others --exclude-standard \
     | grep -vE '\.(md|o)$' \

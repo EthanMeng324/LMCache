@@ -658,6 +658,76 @@ class CxlBackend(StorageBackendInterface):
 
         return memory_obj
 
+    def _batched_contains_prefix_blocking(
+        self,
+        keys: list[CacheEngineKey],
+        pin: bool,
+    ) -> int:
+        """Blocking helper for async prefix-contains.
+
+        Returns the number of *contiguous prefix* keys that exist in CXL.
+        """
+        num_hit_chunks = 0
+        for key in keys:
+            # NOTE: prefix-based counting (stop at first miss), consistent with
+            # LocalCPUBackend/LocalDiskBackend async loading semantics.
+            if not self.contains(key, pin=pin):
+                return num_hit_chunks
+            num_hit_chunks += 1
+        return num_hit_chunks
+
+    async def batched_async_contains(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        """Async prefix-contains for CXL.
+
+        We wrap the blocking `contains()` (which calls into the C library) in a
+        worker thread to avoid blocking the storage manager event loop.
+        """
+        # lookup_id is currently unused for CXL.
+        _ = lookup_id
+        # asyncio.to_thread() returns an awaitable executed in the default pool.
+        return await asyncio.to_thread(
+            self._batched_contains_prefix_blocking, list(keys), pin
+        )
+
+    def _batched_get_prefix_blocking(
+        self,
+        keys: list[CacheEngineKey],
+    ) -> list[MemoryObj]:
+        """Blocking helper for async batched_get_non_blocking.
+
+        Best-effort: if a key disappears after lookup/pin, stop early and return
+        the successfully loaded prefix. This matches the engine's contiguous-hit
+        expectation (break at first missing chunk).
+        """
+        mem_objs: list[MemoryObj] = []
+        for key in keys:
+            mem_obj = self.get_blocking(key)
+            if mem_obj is None:
+                break
+            mem_objs.append(mem_obj)
+        return mem_objs
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        transfer_spec: Any = None,
+    ) -> list[MemoryObj]:
+        """Async CXL prefetch.
+
+        Loads KV from CXL into pinned CPU staging buffers (see `load_bytes_from_cxl`)
+        using a background thread so this call can run concurrently with other
+        backends under `async_lookup_and_prefetch()`.
+        """
+        _ = lookup_id
+        _ = transfer_spec
+        return await asyncio.to_thread(self._batched_get_prefix_blocking, list(keys))
+
     def get_non_blocking(
         self,
         key: CacheEngineKey,
