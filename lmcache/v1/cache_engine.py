@@ -1456,6 +1456,8 @@ class LMCacheEngine:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
         last_failed_block_start = None
+        backend_hit_tokens = kwargs.get("backend_hit_tokens")
+        hit_segments: list[tuple[str, int, int]] = []
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
@@ -1483,6 +1485,7 @@ class LMCacheEngine:
                         last_failed_block_start = start
                     break
                 reordered_chunks.append((key, memory_obj, start, end))
+                hit_segments.append((str(location), int(start), int(end)))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
 
@@ -1494,6 +1497,16 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
+            hit_segments = [
+                (loc, start, end)
+                for loc, start, end in hit_segments
+                if end < last_failed_block_start
+            ]
+        if isinstance(backend_hit_tokens, dict):
+            for location, start, end in hit_segments:
+                backend_hit_tokens[location] = int(backend_hit_tokens.get(location, 0)) + int(
+                    end - start
+                )
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(

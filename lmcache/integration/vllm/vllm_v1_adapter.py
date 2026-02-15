@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import threading
 
 # Third Party
 from vllm.config import (
@@ -84,6 +85,69 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# ------------------------------
+# Process-wide request stats aggregator (best-effort; per-process)
+# ------------------------------
+_REQ_STATS_LOCK = threading.RLock()
+_REQ_STATS_BY_ID: dict[str, dict[str, Any]] = {}
+_REQ_STATS_CUM: dict[str, int] = {"total": 0, "gpu": 0}
+
+
+def _rs_get(req_id: str) -> dict[str, Any]:
+    with _REQ_STATS_LOCK:
+        d = _REQ_STATS_BY_ID.get(req_id)
+        if d is None:
+            d = {"total": 0, "gpu": 0, "tiers": {}}
+            _REQ_STATS_BY_ID[req_id] = d
+        return d
+
+
+def _rs_pop(req_id: str) -> Optional[dict[str, Any]]:
+    with _REQ_STATS_LOCK:
+        return _REQ_STATS_BY_ID.pop(req_id, None)
+
+
+def _rs_add_cum(total: int, gpu: int, tiers: dict[str, int]) -> None:
+    with _REQ_STATS_LOCK:
+        _REQ_STATS_CUM["total"] = int(_REQ_STATS_CUM.get("total", 0)) + int(total)
+        _REQ_STATS_CUM["gpu"] = int(_REQ_STATS_CUM.get("gpu", 0)) + int(gpu)
+        for k, v in tiers.items():
+            _REQ_STATS_CUM[k] = int(_REQ_STATS_CUM.get(k, 0)) + int(v)
+
+
+def _rs_cum_rates() -> dict[str, float]:
+    with _REQ_STATS_LOCK:
+        tot = int(_REQ_STATS_CUM.get("total", 0))
+        if tot <= 0:
+            return {}
+        rates = {}
+        for k, v in _REQ_STATS_CUM.items():
+            if k == "total":
+                continue
+            rates[k] = float(int(v)) / float(tot)
+        return rates
+
+
+def _enabled_backend_tiers(config: LMCacheEngineConfig) -> list[str]:
+    tiers: list[str] = []
+    if bool(getattr(config, "local_cpu", False)) and float(
+        getattr(config, "max_local_cpu_size", 0.0)
+    ) > 0.0:
+        tiers.append("cpu")
+    extra = getattr(config, "extra_config", None) or {}
+    if extra.get("cxl_dax_device") is not None:
+        tiers.append("cxl")
+    return tiers
+
+
+def _location_to_tier(location: str) -> Optional[str]:
+    s = str(location)
+    if "CxlBackend" in s:
+        return "cxl"
+    if "LocalCPUBackend" in s:
+        return "cpu"
+    return None
 
 
 @dataclass
@@ -684,6 +748,11 @@ class LMCacheConnectorV1Impl:
         ] = []
         self.layerwise_storers: list[Generator[Optional[torch.Tensor], None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self._log_req_stats = bool(
+            int(vllm_config.kv_transfer_config.get_from_extra_config("log_stats", 1))
+        )
+        self._enabled_tiers = _enabled_backend_tiers(config)
+        self._primary_tier = self._enabled_tiers[0] if self._enabled_tiers else None
         self.lmcache_engine_metadata: LMCacheEngineMetadata
         if role == KVConnectorRole.SCHEDULER:
             self.lmcache_engine: Optional[LMCacheEngine] = None
@@ -1013,6 +1082,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                backend_hit_tokens: dict[str, int] = {}
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -1021,6 +1091,7 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                     skip_contains_check=True,
+                    backend_hit_tokens=backend_hit_tokens,
                 )
 
                 # Check the result
@@ -1050,6 +1121,15 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                if backend_hit_tokens:
+                    rd = _rs_get(str(request.req_id))
+                    tiers = dict(rd.get("tiers", {}) or {})
+                    for location, tok in backend_hit_tokens.items():
+                        tname = _location_to_tier(location)
+                        if tname is None or tname not in self._enabled_tiers:
+                            continue
+                        tiers[tname] = int(tiers.get(tname, 0)) + int(tok)
+                    rd["tiers"] = tiers
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
                 request.load_spec.vllm_cached_tokens
@@ -1471,6 +1551,11 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+        req_id = str(request.request_id)
+        rd = _rs_get(req_id)
+        total_tokens = int(getattr(request, "num_tokens", 0) or 0)
+        rd["total"] = max(int(rd.get("total", 0)), total_tokens)
+        rd["gpu"] = max(int(rd.get("gpu", 0)), int(num_computed_tokens))
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1840,12 +1925,49 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        _ = block_ids
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
             # Cancel any ongoing async lookup and prefetch tasks on workers
             lookup_id = request.request_id
             self.lookup_client.cancel_lookup(  # type: ignore[attr-defined]
                 lookup_id
+            )
+
+        if self._log_req_stats:
+            rid = str(request.request_id)
+            rs = _rs_pop(rid) or {}
+            total = max(
+                int(getattr(request, "num_tokens", 0) or 0),
+                int(rs.get("total", 0)),
+            )
+            gpu = min(max(0, int(rs.get("gpu", 0))), total)
+
+            tiers_in = dict(rs.get("tiers", {}) or {})
+            tiers = {name: int(tiers_in.get(name, 0)) for name in self._enabled_tiers}
+            # Bound backend totals so gpu+backend cannot exceed total.
+            ext_total = sum(tiers.values())
+            if gpu + ext_total > total and ext_total > 0:
+                scale = float(max(0, total - gpu)) / float(ext_total)
+                for tname in list(tiers.keys()):
+                    tiers[tname] = int(float(tiers[tname]) * scale)
+
+            _rs_add_cum(total=total, gpu=gpu, tiers=tiers)
+            cum_rates = _rs_cum_rates()
+
+            token_parts = [f"gpu={gpu}"]
+            for tname in self._enabled_tiers:
+                token_parts.append(f"{tname}={int(tiers.get(tname, 0))}")
+            rate_parts = [f"gpu={float(cum_rates.get('gpu', 0.0))*100.0:.1f}%"]
+            for tname in self._enabled_tiers:
+                rate_parts.append(f"{tname}={float(cum_rates.get(tname, 0.0))*100.0:.1f}%")
+
+            logger.info(
+                "LMCache(vLLM) req_done: req=%s tok=%d %s | cum_hit_rate: %s",
+                rid,
+                total,
+                " ".join(token_parts),
+                " ".join(rate_parts),
             )
 
         params = (
