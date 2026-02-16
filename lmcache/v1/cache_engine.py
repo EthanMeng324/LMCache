@@ -359,7 +359,7 @@ class LMCacheEngine:
         event_block_hashes: List[int] = []
         event_token_ids: List[int] = []
         event_parent_block_hash: Optional[int] = None
-        event_total_tokens = 0
+        event_block_size = getattr(self.token_database, "chunk_size", self.config.chunk_size)
         for start, end, key in self.token_database.process_tokens(
             tokens,
             hashes,
@@ -401,7 +401,6 @@ class LMCacheEngine:
                 if not event_block_hashes:
                     event_parent_block_hash = None if start == 0 else prev_key
                 event_block_hashes.append(key.chunk_hash)
-                event_total_tokens += num_tokens
                 if tokens is not None:
                     event_token_ids.extend(
                         convert_tokens_to_list(
@@ -419,7 +418,7 @@ class LMCacheEngine:
                 block_hashes=event_block_hashes,
                 parent_block_hash=event_parent_block_hash,
                 token_ids=event_token_ids,
-                block_size=event_total_tokens,
+                block_size=event_block_size,
                 lora_id=None,
                 medium="cpu",
             )
@@ -527,7 +526,7 @@ class LMCacheEngine:
         event_block_hashes: List[int] = []
         event_token_ids: List[int] = []
         event_parent_block_hash: Optional[int] = None
-        event_total_tokens = 0
+        event_block_size = getattr(self.token_database, "chunk_size", self.config.chunk_size)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -568,7 +567,6 @@ class LMCacheEngine:
                 if not event_block_hashes:
                     event_parent_block_hash = None if start == 0 else prev_key
                 event_block_hashes.append(key.chunk_hash)
-                event_total_tokens += num_tokens
                 event_token_ids.extend(
                     convert_tokens_to_list(
                         tokens,
@@ -583,7 +581,7 @@ class LMCacheEngine:
                 block_hashes=event_block_hashes,
                 parent_block_hash=event_parent_block_hash,
                 token_ids=event_token_ids,
-                block_size=event_total_tokens,
+                block_size=event_block_size,
                 lora_id=None,
                 medium="cpu",
             )
