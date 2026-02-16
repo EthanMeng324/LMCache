@@ -411,6 +411,14 @@ class LMCacheEngine:
                 elif hashes is not None:
                     stored_event.token_ids = hashes[start : end + 1]
                 self.kv_events.append(stored_event)
+                logger.info(
+                    "Queued KV store event: num_blocks=%d, medium=%s, "
+                    "block_size=%d, parent_block_hash=%s",
+                    len(stored_event.block_hashes),
+                    stored_event.medium or "unknown",
+                    stored_event.block_size,
+                    stored_event.parent_block_hash,
+                )
                 prev_key = key.chunk_hash
 
         # memory_objs might be empty, directly return to avoid sending tokens
@@ -555,6 +563,14 @@ class LMCacheEngine:
                     end,
                 )
                 self.kv_events.append(stored_event)
+                logger.info(
+                    "Queued KV store event: num_blocks=%d, medium=%s, "
+                    "block_size=%d, parent_block_hash=%s",
+                    len(stored_event.block_hashes),
+                    stored_event.medium or "unknown",
+                    stored_event.block_size,
+                    stored_event.parent_block_hash,
+                )
                 prev_key = key.chunk_hash
 
         if keys:
@@ -1271,17 +1287,6 @@ class LMCacheEngine:
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and (events := self.kv_events):
             self.kv_events = []
-            for evt in events:
-                num_blocks = len(evt.block_hashes)
-                medium = evt.medium or "unknown"
-                logger.info(
-                    "Sending KV store event: num_blocks=%d, medium=%s, "
-                    "block_size=%d, parent_block_hash=%s",
-                    num_blocks,
-                    medium,
-                    evt.block_size,
-                    evt.parent_block_hash,
-                )
             return events
         return []
 
