@@ -408,8 +408,6 @@ class LMCacheEngine:
                         start,
                         end,
                     )
-                    # if isinstance(tokens, torch.Tensor):
-                    #     stored_event.medium = tokens.device
                 elif hashes is not None:
                     stored_event.token_ids = hashes[start : end + 1]
                 self.kv_events.append(stored_event)
@@ -453,7 +451,6 @@ class LMCacheEngine:
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[None, None, None]:
-        logger.info(f"LMCacheEngine.store_layer() called: kv_events_enabled={self.kv_events_enabled}, tokens is not None={tokens is not None}")
         """
         Store the KV cache in a layerwise manner.
 
@@ -552,16 +549,10 @@ class LMCacheEngine:
                     lora_id=None,
                     medium="cpu",
                 )
-                if tokens is not None:
-                    stored_event.token_ids = convert_tokens_to_list(
-                        tokens,
-                        start,
-                        end,
-                    )
-                    # if isinstance(tokens, torch.Tensor):
-                    #     stored_event.medium = tokens.device
-                logger.info(
-                    f"Added kv cache event with medium='{stored_event.medium}' to kv cache events queue: {stored_event}"
+                stored_event.token_ids = convert_tokens_to_list(
+                    tokens,
+                    start,
+                    end,
                 )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
@@ -1280,6 +1271,17 @@ class LMCacheEngine:
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and (events := self.kv_events):
             self.kv_events = []
+            for evt in events:
+                num_blocks = len(evt.block_hashes)
+                medium = evt.medium or "unknown"
+                logger.info(
+                    "Sending KV store event: num_blocks=%d, medium=%s, "
+                    "block_size=%d, parent_block_hash=%s",
+                    num_blocks,
+                    medium,
+                    evt.block_size,
+                    evt.parent_block_hash,
+                )
             return events
         return []
 
