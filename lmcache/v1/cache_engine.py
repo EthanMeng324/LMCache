@@ -356,6 +356,10 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        event_block_hashes: List[int] = []
+        event_token_ids: List[int] = []
+        event_parent_block_hash: Optional[int] = None
+        event_total_tokens = 0
         for start, end, key in self.token_database.process_tokens(
             tokens,
             hashes,
@@ -392,34 +396,42 @@ class LMCacheEngine:
             tot_kv_size += memory_obj.get_size()
             tot_token_num += num_tokens
 
-            # Create KV event
+            # Aggregate KV event for this store() call
             if self.kv_events_enabled:
-                stored_event = CacheStoreEvent(
-                    block_hashes=[key.chunk_hash],
-                    parent_block_hash=None if start == 0 else prev_key,
-                    token_ids=[],
-                    block_size=num_tokens,
-                    lora_id=None,
-                    medium="cpu",
-                )
+                if not event_block_hashes:
+                    event_parent_block_hash = None if start == 0 else prev_key
+                event_block_hashes.append(key.chunk_hash)
+                event_total_tokens += num_tokens
                 if tokens is not None:
-                    stored_event.token_ids = convert_tokens_to_list(
-                        tokens,
-                        start,
-                        end,
+                    event_token_ids.extend(
+                        convert_tokens_to_list(
+                            tokens,
+                            start,
+                            end,
+                        )
                     )
                 elif hashes is not None:
-                    stored_event.token_ids = hashes[start : end + 1]
-                self.kv_events.append(stored_event)
-                logger.info(
-                    "Queued KV store event: num_blocks=%d, medium=%s, "
-                    "block_size=%d, parent_block_hash=%s",
-                    len(stored_event.block_hashes),
-                    stored_event.medium or "unknown",
-                    stored_event.block_size,
-                    stored_event.parent_block_hash,
-                )
+                    event_token_ids.extend(hashes[start : end + 1])
                 prev_key = key.chunk_hash
+
+        if self.kv_events_enabled and event_block_hashes:
+            stored_event = CacheStoreEvent(
+                block_hashes=event_block_hashes,
+                parent_block_hash=event_parent_block_hash,
+                token_ids=event_token_ids,
+                block_size=event_total_tokens,
+                lora_id=None,
+                medium="cpu",
+            )
+            self.kv_events.append(stored_event)
+            logger.info(
+                "Queued KV store event: num_blocks=%d, medium=%s, "
+                "block_size=%d, parent_block_hash=%s",
+                len(stored_event.block_hashes),
+                stored_event.medium or "unknown",
+                stored_event.block_size,
+                stored_event.parent_block_hash,
+            )
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
@@ -512,6 +524,10 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        event_block_hashes: List[int] = []
+        event_token_ids: List[int] = []
+        event_parent_block_hash: Optional[int] = None
+        event_total_tokens = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -547,31 +563,39 @@ class LMCacheEngine:
             memory_objs.append(memory_objs_multi_layer)
             tot_token_num += num_tokens
 
-            # Create KV event
+            # Aggregate KV event for this store_layer() call
             if self.kv_events_enabled and tokens is not None:
-                stored_event = CacheStoreEvent(
-                    block_hashes=[key.chunk_hash],
-                    parent_block_hash=None if start == 0 else prev_key,
-                    token_ids=[],
-                    block_size=num_tokens,
-                    lora_id=None,
-                    medium="cpu",
-                )
-                stored_event.token_ids = convert_tokens_to_list(
-                    tokens,
-                    start,
-                    end,
-                )
-                self.kv_events.append(stored_event)
-                logger.info(
-                    "Queued KV store event: num_blocks=%d, medium=%s, "
-                    "block_size=%d, parent_block_hash=%s",
-                    len(stored_event.block_hashes),
-                    stored_event.medium or "unknown",
-                    stored_event.block_size,
-                    stored_event.parent_block_hash,
+                if not event_block_hashes:
+                    event_parent_block_hash = None if start == 0 else prev_key
+                event_block_hashes.append(key.chunk_hash)
+                event_total_tokens += num_tokens
+                event_token_ids.extend(
+                    convert_tokens_to_list(
+                        tokens,
+                        start,
+                        end,
+                    )
                 )
                 prev_key = key.chunk_hash
+
+        if self.kv_events_enabled and event_block_hashes:
+            stored_event = CacheStoreEvent(
+                block_hashes=event_block_hashes,
+                parent_block_hash=event_parent_block_hash,
+                token_ids=event_token_ids,
+                block_size=event_total_tokens,
+                lora_id=None,
+                medium="cpu",
+            )
+            self.kv_events.append(stored_event)
+            logger.info(
+                "Queued KV store event: num_blocks=%d, medium=%s, "
+                "block_size=%d, parent_block_hash=%s",
+                len(stored_event.block_hashes),
+                stored_event.medium or "unknown",
+                stored_event.block_size,
+                stored_event.parent_block_hash,
+            )
 
         if keys:
             # Transpose the keys and memory objects into layer major format
