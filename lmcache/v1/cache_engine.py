@@ -188,6 +188,7 @@ class LMCacheEngine:
         self.kv_events_enabled = config.enable_kv_events
         if self.kv_events_enabled:
             self.kv_events: List[CacheStoreEvent] = []
+            self._kv_event_tail_hash_by_req: Dict[str, int] = {}
             logger.info("KV events are enabled.")
         else:
             logger.info("KV events are disabled.")
@@ -354,6 +355,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        request_id = kwargs.get("request_id")
 
         prev_key = 0
         event_block_hashes: List[int] = []
@@ -399,7 +401,14 @@ class LMCacheEngine:
             # Aggregate KV event for this store() call
             if self.kv_events_enabled:
                 if not event_block_hashes:
-                    event_parent_block_hash = None if start == 0 else prev_key
+                    if start == 0:
+                        event_parent_block_hash = None
+                    elif request_id is not None:
+                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(
+                            request_id
+                        )
+                    else:
+                        event_parent_block_hash = prev_key if prev_key != 0 else None
                 event_block_hashes.append(key.chunk_hash)
                 if tokens is not None:
                     event_token_ids.extend(
@@ -424,13 +433,16 @@ class LMCacheEngine:
             )
             self.kv_events.append(stored_event)
             logger.info(
-                "Queued KV store event: num_blocks=%d, medium=%s, "
+                "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
                 "block_size=%d, parent_block_hash=%s",
+                request_id,
                 len(stored_event.block_hashes),
                 stored_event.medium or "unknown",
                 stored_event.block_size,
                 stored_event.parent_block_hash,
             )
+            if request_id is not None:
+                self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
@@ -521,6 +533,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        request_id = kwargs.get("request_id")
 
         prev_key = 0
         event_block_hashes: List[int] = []
@@ -565,7 +578,14 @@ class LMCacheEngine:
             # Aggregate KV event for this store_layer() call
             if self.kv_events_enabled and tokens is not None:
                 if not event_block_hashes:
-                    event_parent_block_hash = None if start == 0 else prev_key
+                    if start == 0:
+                        event_parent_block_hash = None
+                    elif request_id is not None:
+                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(
+                            request_id
+                        )
+                    else:
+                        event_parent_block_hash = prev_key if prev_key != 0 else None
                 event_block_hashes.append(key.chunk_hash)
                 event_token_ids.extend(
                     convert_tokens_to_list(
@@ -587,13 +607,16 @@ class LMCacheEngine:
             )
             self.kv_events.append(stored_event)
             logger.info(
-                "Queued KV store event: num_blocks=%d, medium=%s, "
+                "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
                 "block_size=%d, parent_block_hash=%s",
+                request_id,
                 len(stored_event.block_hashes),
                 stored_event.medium or "unknown",
                 stored_event.block_size,
                 stored_event.parent_block_hash,
             )
+            if request_id is not None:
+                self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
         if keys:
             # Transpose the keys and memory objects into layer major format
