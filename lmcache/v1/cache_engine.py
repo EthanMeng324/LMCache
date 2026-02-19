@@ -442,6 +442,30 @@ class LMCacheEngine:
                 stored_event.parent_block_hash,
             )
             if request_id is not None:
+                is_first_event = request_id not in self._kv_event_tail_hash_by_req
+                parent_is_none = stored_event.parent_block_hash is None
+                if is_first_event and not parent_is_none:
+                    logger.warning(
+                        "KV event parent-check failed: first event should have "
+                        "parent_block_hash=None (req_id=%s, parent=%s)",
+                        request_id,
+                        stored_event.parent_block_hash,
+                    )
+                elif (not is_first_event) and parent_is_none:
+                    logger.warning(
+                        "KV event parent-check failed: non-first event should have "
+                        "non-None parent_block_hash (req_id=%s)",
+                        request_id,
+                    )
+                else:
+                    logger.info(
+                        "KV event parent-check passed: req_id=%s, is_first_event=%s, "
+                        "parent_block_hash=%s",
+                        request_id,
+                        is_first_event,
+                        stored_event.parent_block_hash,
+                    )
+            if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
         # memory_objs might be empty, directly return to avoid sending tokens
@@ -615,6 +639,30 @@ class LMCacheEngine:
                 stored_event.block_size,
                 stored_event.parent_block_hash,
             )
+            if request_id is not None:
+                is_first_event = request_id not in self._kv_event_tail_hash_by_req
+                parent_is_none = stored_event.parent_block_hash is None
+                if is_first_event and not parent_is_none:
+                    logger.warning(
+                        "KV event parent-check failed: first event should have "
+                        "parent_block_hash=None (req_id=%s, parent=%s)",
+                        request_id,
+                        stored_event.parent_block_hash,
+                    )
+                elif (not is_first_event) and parent_is_none:
+                    logger.warning(
+                        "KV event parent-check failed: non-first event should have "
+                        "non-None parent_block_hash (req_id=%s)",
+                        request_id,
+                    )
+                else:
+                    logger.info(
+                        "KV event parent-check passed: req_id=%s, is_first_event=%s, "
+                        "parent_block_hash=%s",
+                        request_id,
+                        is_first_event,
+                        stored_event.parent_block_hash,
+                    )
             if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
