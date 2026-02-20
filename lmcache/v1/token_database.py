@@ -250,16 +250,15 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         self._hash_debug[h] = rec
         if len(self._hash_debug) > self._hash_debug_cap:
             self._hash_debug.pop(next(iter(self._hash_debug)))
-        if h in self._watch_hashes:
-            logger.warning(
-                "WATCH chunk_hash=%d pid=%d seed=%s NONE_HASH=%s prefix_hash=%s "
-                "tok_len=%d tok_head=%s tok_tail=%s extra_keys=%s",
-                h, os.getpid(), os.getenv("PYTHONHASHSEED"),
-                NONE_HASH, prefix_hash,
-                len(tokens_tuple), tokens_tuple[:8],
-                tokens_tuple[-8:] if len(tokens_tuple) >= 8 else tokens_tuple,
-                extra_keys,
-            )
+        logger.warning(
+            "WATCH chunk_hash=%d pid=%d seed=%s NONE_HASH=%s prefix_hash=%s "
+            "tok_len=%d tok_head=%s tok_tail=%s extra_keys=%s",
+            h, os.getpid(), os.getenv("PYTHONHASHSEED"),
+            NONE_HASH, prefix_hash,
+            len(tokens_tuple), tokens_tuple[:8],
+            tokens_tuple[-8:] if len(tokens_tuple) >= 8 else tokens_tuple,
+            extra_keys,
+        )
 
         # Ignore extra keys for now
         # Extra keys are for multi-modal inputs and
