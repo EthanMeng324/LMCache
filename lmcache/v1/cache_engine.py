@@ -528,7 +528,7 @@ class LMCacheEngine:
                 token_ids=event_token_ids,
                 block_size=event_block_size,
                 lora_id=None,
-                medium="cpu",
+                medium="CPU",
             )
             self.kv_events.append(stored_event)
             logger.info(
@@ -722,7 +722,7 @@ class LMCacheEngine:
                 token_ids=event_token_ids,
                 block_size=event_block_size,
                 lora_id=None,
-                medium="cpu",
+                medium="CPU",
             )
             self.kv_events.append(stored_event)
             logger.info(
