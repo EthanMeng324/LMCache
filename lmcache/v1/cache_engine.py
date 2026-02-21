@@ -244,6 +244,89 @@ class LMCacheEngine:
                 self.gpu_connector.initialize_kvcaches_ptr(**kwargs)
             self.post_inited = True
 
+    def _infer_parent_block_hash(
+        self,
+        start: int,
+        tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        request_configs: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Infer parent block hash for the first stored chunk when start > 0."""
+        if start <= 0:
+            return None
+
+        try:
+            if tokens is not None:
+                chunk_iter = self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=None,
+                    make_key=False,
+                    request_configs=request_configs,
+                )
+            elif hashes is not None and offsets is not None:
+                chunk_iter = self.token_database.process_tokens(
+                    hashes=hashes,
+                    offsets=offsets,
+                    make_key=False,
+                    request_configs=request_configs,
+                )
+            else:
+                return None
+
+            for chunk_start, chunk_end, chunk_hash in chunk_iter:
+                if chunk_end == start:
+                    return int(chunk_hash)
+                if chunk_start >= start:
+                    break
+        except Exception as e:
+            logger.warning(
+                "Failed to infer KV event parent hash (start=%s): %s",
+                start,
+                e,
+            )
+        return None
+
+    def _log_kv_event_parent_check(
+        self,
+        request_id: str,
+        is_first_event: bool,
+        first_block_start: Optional[int],
+        parent_block_hash: Optional[int],
+    ) -> None:
+        # For the first event of a request, parent can be non-None if storing
+        # starts from a non-zero offset (e.g. prefix chunks were skipped).
+        expects_parent_none = is_first_event and first_block_start == 0
+        parent_is_none = parent_block_hash is None
+
+        if expects_parent_none and not parent_is_none:
+            logger.warning(
+                "KV event parent-check failed: first event starting at token 0 "
+                "should have parent_block_hash=None (req_id=%s, parent=%s)",
+                request_id,
+                parent_block_hash,
+            )
+            return
+
+        if (not expects_parent_none) and parent_is_none:
+            logger.warning(
+                "KV event parent-check failed: expected non-None parent "
+                "(req_id=%s, is_first_event=%s, first_block_start=%s)",
+                request_id,
+                is_first_event,
+                first_block_start,
+            )
+            return
+
+        logger.info(
+            "KV event parent-check passed: req_id=%s, is_first_event=%s, "
+            "first_block_start=%s, parent_block_hash=%s",
+            request_id,
+            is_first_event,
+            first_block_start,
+            parent_block_hash,
+        )
+
     def freeze(self, enabled: bool) -> None:
         """
         Set the freeze mode for the cache engine.
@@ -361,6 +444,7 @@ class LMCacheEngine:
         event_block_hashes: List[int] = []
         event_token_ids: List[int] = []
         event_parent_block_hash: Optional[int] = None
+        event_first_block_start: Optional[int] = None
         event_block_size = getattr(self.token_database, "chunk_size", self.config.chunk_size)
         for start, end, key in self.token_database.process_tokens(
             tokens,
@@ -401,14 +485,29 @@ class LMCacheEngine:
             # Aggregate KV event for this store() call
             if self.kv_events_enabled:
                 if not event_block_hashes:
+                    event_first_block_start = start
                     if start == 0:
                         event_parent_block_hash = None
                     elif request_id is not None:
-                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(
-                            request_id
-                        )
+                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(request_id)
+                        if event_parent_block_hash is None:
+                            event_parent_block_hash = self._infer_parent_block_hash(
+                                start=start,
+                                tokens=tokens,
+                                hashes=hashes,
+                                offsets=offsets,
+                                request_configs=request_configs,
+                            )
                     else:
-                        event_parent_block_hash = prev_key if prev_key != 0 else None
+                        event_parent_block_hash = self._infer_parent_block_hash(
+                            start=start,
+                            tokens=tokens,
+                            hashes=hashes,
+                            offsets=offsets,
+                            request_configs=request_configs,
+                        )
+                        if event_parent_block_hash is None:
+                            event_parent_block_hash = prev_key if prev_key != 0 else None
                 event_block_hashes.append(key.chunk_hash)
                 if tokens is not None:
                     event_token_ids.extend(
@@ -419,7 +518,7 @@ class LMCacheEngine:
                         )
                     )
                 elif hashes is not None:
-                    event_token_ids.extend(hashes[start : end + 1])
+                    event_token_ids.extend(hashes[start:end])
                 prev_key = key.chunk_hash
 
         if self.kv_events_enabled and event_block_hashes:
@@ -443,28 +542,12 @@ class LMCacheEngine:
             )
             if request_id is not None:
                 is_first_event = request_id not in self._kv_event_tail_hash_by_req
-                parent_is_none = stored_event.parent_block_hash is None
-                if is_first_event and not parent_is_none:
-                    logger.warning(
-                        "KV event parent-check failed: first event should have "
-                        "parent_block_hash=None (req_id=%s, parent=%s)",
-                        request_id,
-                        stored_event.parent_block_hash,
-                    )
-                elif (not is_first_event) and parent_is_none:
-                    logger.warning(
-                        "KV event parent-check failed: non-first event should have "
-                        "non-None parent_block_hash (req_id=%s)",
-                        request_id,
-                    )
-                else:
-                    logger.info(
-                        "KV event parent-check passed: req_id=%s, is_first_event=%s, "
-                        "parent_block_hash=%s",
-                        request_id,
-                        is_first_event,
-                        stored_event.parent_block_hash,
-                    )
+                self._log_kv_event_parent_check(
+                    request_id=request_id,
+                    is_first_event=is_first_event,
+                    first_block_start=event_first_block_start,
+                    parent_block_hash=stored_event.parent_block_hash,
+                )
             if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
@@ -563,6 +646,7 @@ class LMCacheEngine:
         event_block_hashes: List[int] = []
         event_token_ids: List[int] = []
         event_parent_block_hash: Optional[int] = None
+        event_first_block_start: Optional[int] = None
         event_block_size = getattr(self.token_database, "chunk_size", self.config.chunk_size)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
@@ -602,14 +686,25 @@ class LMCacheEngine:
             # Aggregate KV event for this store_layer() call
             if self.kv_events_enabled and tokens is not None:
                 if not event_block_hashes:
+                    event_first_block_start = start
                     if start == 0:
                         event_parent_block_hash = None
                     elif request_id is not None:
-                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(
-                            request_id
-                        )
+                        event_parent_block_hash = self._kv_event_tail_hash_by_req.get(request_id)
+                        if event_parent_block_hash is None:
+                            event_parent_block_hash = self._infer_parent_block_hash(
+                                start=start,
+                                tokens=tokens,
+                                request_configs=request_configs,
+                            )
                     else:
-                        event_parent_block_hash = prev_key if prev_key != 0 else None
+                        event_parent_block_hash = self._infer_parent_block_hash(
+                            start=start,
+                            tokens=tokens,
+                            request_configs=request_configs,
+                        )
+                        if event_parent_block_hash is None:
+                            event_parent_block_hash = prev_key if prev_key != 0 else None
                 event_block_hashes.append(key.chunk_hash)
                 event_token_ids.extend(
                     convert_tokens_to_list(
@@ -641,28 +736,12 @@ class LMCacheEngine:
             )
             if request_id is not None:
                 is_first_event = request_id not in self._kv_event_tail_hash_by_req
-                parent_is_none = stored_event.parent_block_hash is None
-                if is_first_event and not parent_is_none:
-                    logger.warning(
-                        "KV event parent-check failed: first event should have "
-                        "parent_block_hash=None (req_id=%s, parent=%s)",
-                        request_id,
-                        stored_event.parent_block_hash,
-                    )
-                elif (not is_first_event) and parent_is_none:
-                    logger.warning(
-                        "KV event parent-check failed: non-first event should have "
-                        "non-None parent_block_hash (req_id=%s)",
-                        request_id,
-                    )
-                else:
-                    logger.info(
-                        "KV event parent-check passed: req_id=%s, is_first_event=%s, "
-                        "parent_block_hash=%s",
-                        request_id,
-                        is_first_event,
-                        stored_event.parent_block_hash,
-                    )
+                self._log_kv_event_parent_check(
+                    request_id=request_id,
+                    is_first_event=is_first_event,
+                    first_block_start=event_first_block_start,
+                    parent_block_hash=stored_event.parent_block_hash,
+                )
             if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
 
