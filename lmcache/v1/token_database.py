@@ -93,10 +93,6 @@ class TokenDatabase(metaclass=abc.ABCMeta):
                 config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
                 and metadata.use_mla
             )
-        
-        self._hash_debug = {}  # or OrderedDict for LRU
-        self._hash_debug_cap = 4096
-        self._watch_hashes = [16913572400524374531, 5294999304242362823]
 
     def _get_vllm_hash_func(self, hash_algorithm: str):
         """Get hash function from vLLM with version compatibility.
@@ -240,30 +236,20 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         
         
         h = self.hash_func((prefix_hash, tokens_tuple, extra_keys))
-        rec = (
-            prefix_hash,
-            len(tokens_tuple),
-            tokens_tuple[:8],          # only prefix
-            tokens_tuple[-8:] if len(tokens_tuple) >= 8 else tokens_tuple,
-            extra_keys,
-        )
-        self._hash_debug[h] = rec
-        if len(self._hash_debug) > self._hash_debug_cap:
-            self._hash_debug.pop(next(iter(self._hash_debug)))
-        logger.warning(
-            "WATCH chunk_hash=%d pid=%d seed=%s NONE_HASH=%s prefix_hash=%s "
-            "tok_len=%d tok_head=%s tok_tail=%s extra_keys=%s",
-            h, os.getpid(), os.getenv("PYTHONHASHSEED"),
-            NONE_HASH, prefix_hash,
-            len(tokens_tuple), tokens_tuple[:8],
-            tokens_tuple[-8:] if len(tokens_tuple) >= 8 else tokens_tuple,
-            extra_keys,
-        )
+        # logger.warning(
+        #     "WATCH chunk_hash=%d pid=%d seed=%s NONE_HASH=%s prefix_hash=%s "
+        #     "tok_len=%d tok_head=%s tok_tail=%s extra_keys=%s",
+        #     h, os.getpid(), os.getenv("PYTHONHASHSEED"),
+        #     NONE_HASH, prefix_hash,
+        #     len(tokens_tuple), tokens_tuple[:8],
+        #     tokens_tuple[-8:] if len(tokens_tuple) >= 8 else tokens_tuple,
+        #     extra_keys,
+        # )
 
         # Ignore extra keys for now
         # Extra keys are for multi-modal inputs and
         # request specific metadata (e.g., LoRA ID).
-        return self.hash_func((prefix_hash, tokens_tuple, extra_keys))
+        return h
 
 
 class ChunkedTokenDatabase(TokenDatabase):

@@ -1,7 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cxl_shm.h"
 #include "mem_hash.h"
-#define CXL_SHM_DAX_SIZE (1UL << 36) // 64GB
+#include <errno.h>
+#define CXL_SHM_DAX_SIZE_DEFAULT (1UL << 36) // 64GB
 #define CXL_SHM_DAX_PATH_DEFAULT "/dev/dax0.0"
 #define CACHELINE_SIZE 64
 
@@ -13,7 +14,29 @@ static int my_rank = 0;
 static int num_ranks = 0;
 static cxl_shm_lock_t *cxl_shm_lock = NULL;
 static char dax_path[256] = {0}; // Store DAX device path
+static size_t dax_mapped_size = CXL_SHM_DAX_SIZE_DEFAULT;
 static int verbose_not_found = 0;
+
+static size_t get_dax_mapped_size_from_env(void) {
+    const char *env_size = getenv("LMCACHE_CXL_DAX_DEVICE_SIZE");
+    if (env_size == NULL || env_size[0] == '\0') {
+        return CXL_SHM_DAX_SIZE_DEFAULT;
+    }
+
+    errno = 0;
+    char *endptr = NULL;
+    unsigned long long parsed = strtoull(env_size, &endptr, 10);
+    if (errno != 0 || endptr == env_size || (endptr != NULL && *endptr != '\0') || parsed == 0ULL) {
+        fprintf(
+            stderr,
+            "Invalid LMCACHE_CXL_DAX_DEVICE_SIZE='%s', fallback to default %zu bytes\n",
+            env_size,
+            (size_t)CXL_SHM_DAX_SIZE_DEFAULT
+        );
+        return CXL_SHM_DAX_SIZE_DEFAULT;
+    }
+    return (size_t)parsed;
+}
 
 // Spinlock functions
 static void acquire_lock(atomic_flag *lock) {
@@ -163,7 +186,7 @@ __attribute__((visibility("default"))) int cxl_shm_finalize() {
             // clflush_region_with_mfence(&meta->head.initialized, sizeof(meta->head.initialized));
             // if (atomic_load(&meta->head.initialized)) {
                 // memset((char*)dax_addr + sizeof(cxl_lock_t), 0, CXL_SHM_DAX_SIZE - sizeof(cxl_lock_t));
-                memset((char*)dax_addr, 0, CXL_SHM_DAX_SIZE);
+                memset((char*)dax_addr, 0, dax_mapped_size);
                 // clflush_region_with_mfence((char*)dax_addr + sizeof(cxl_lock_t), CXL_SHM_DAX_SIZE - sizeof(cxl_lock_t));
                 atomic_store(&meta->head.initialized, 0);
                 clflush_region_with_mfence(&meta->head.initialized, sizeof(meta->head.initialized));
@@ -176,7 +199,7 @@ __attribute__((visibility("default"))) int cxl_shm_finalize() {
         clflush_region_with_mfence(&meta->head.initialized, sizeof(meta->head.initialized));
     }
 
-    clflush_region_with_mfence((char*)dax_addr, CXL_SHM_DAX_SIZE);
+    clflush_region_with_mfence((char*)dax_addr, dax_mapped_size);
 
     return 0;
 }
@@ -208,8 +231,10 @@ __attribute__((visibility("default"))) int cxl_shm_init(int num_procs, int rank)
         return -1;
     }
  
-    // Memory-map the entire DAX device
-    void *addr = mmap(NULL, CXL_SHM_DAX_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    dax_mapped_size = get_dax_mapped_size_from_env();
+
+    // Memory-map the configured DAX size window.
+    void *addr = mmap(NULL, dax_mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "Failed to mmap DAX device\n");
         close(fd);
@@ -325,7 +350,7 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
     // Only need to check remaining space when we extend from curr_offset.
     // For reused_offset != 0, caller guarantees the offset is valid.
     if (reused_offset == 0) {
-        size_t dax_size = CXL_SHM_DAX_SIZE;
+        size_t dax_size = dax_mapped_size;
         if (obj_offset + size > dax_size) {
             fprintf(stderr, "Not enough space in DAX device, device size %zu, data size: %zu, obj_offset: %lu, meta->head.curr_offset: %lu \n", dax_size, size, obj_offset, meta->head.curr_offset);
             // cxl_release_lock(&meta->head.lock, my_pid);

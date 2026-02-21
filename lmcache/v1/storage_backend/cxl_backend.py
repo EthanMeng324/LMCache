@@ -41,9 +41,49 @@ logger = init_logger(__name__)
 
 # Default DAX device path (from cxl_shm.c)
 DEFAULT_DAX_DEVICE = "/dev/dax1.0"
+# Fallback used only when extra_config.max_cxl_size is explicitly none/null.
+DEFAULT_CXL_DAX_SIZE_BYTES = 1 << 36  # 64GB
 
 # Constants from cxl_shm.h
 CXL_SHM_ONAME_LEN = 20  # Maximum object name length
+
+
+def _resolve_cxl_device_size_bytes(extra_config: Optional[dict[str, Any]]) -> tuple[int, bool]:
+    """
+    Resolve CXL device size from YAML extra_config.max_cxl_size.
+
+    Returns:
+        (size_bytes, used_default)
+    """
+    raw_value = None if extra_config is None else extra_config.get("max_cxl_size", None)
+
+    # Only none/null maps to default value.
+    if raw_value is None:
+        return (DEFAULT_CXL_DAX_SIZE_BYTES, True)
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in ("none", "null", "~"):
+            return (DEFAULT_CXL_DAX_SIZE_BYTES, True)
+        if text == "":
+            raise ValueError("extra_config.max_cxl_size must be a number in GB or 'none'.")
+        raw_value = text
+
+    try:
+        size_gb = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid extra_config.max_cxl_size={raw_value!r}. "
+            "Expected a positive number (GB) or 'none'."
+        ) from exc
+
+    if size_gb <= 0:
+        raise ValueError(
+            f"Invalid extra_config.max_cxl_size={raw_value!r}. "
+            "Expected a positive number (GB) or 'none'."
+        )
+
+    return (int(size_gb * 1024**3), False)
 
 
 class CxlWorker:
@@ -81,8 +121,7 @@ class CxlBackend(StorageBackendInterface):
         # Track actual bytes consumed in CXL per key (includes header + padding).
         self._stored_sizes: dict[CacheEngineKey, int] = {}
 
-        # Get configuration for C library
-        # Note: cxl_shm.c uses hardcoded values, but we can override via environment
+        # Get configuration for C library.
         num_procs = config.extra_config.get("cxl_num_procs", 1) if config.extra_config else 1
         rank = config.extra_config.get("cxl_rank", 0) if config.extra_config else 0
         
@@ -96,6 +135,22 @@ class CxlBackend(StorageBackendInterface):
         # Set environment variable for C library to use
         os.environ["LMCACHE_CXL_DAX_DEVICE"] = dax_device
         logger.info(f"Using CXL DAX device: {dax_device}")
+
+        # Single source of truth for CXL size:
+        # - read from YAML extra_config.max_cxl_size
+        # - pass to C layer via env before cxl_shm_init()
+        cxl_size_bytes, used_default_size = _resolve_cxl_device_size_bytes(config.extra_config)
+        os.environ["LMCACHE_CXL_DAX_DEVICE_SIZE"] = str(cxl_size_bytes)
+        if used_default_size:
+            logger.info(
+                "extra_config.max_cxl_size is none/null, using default CXL size: %d bytes",
+                cxl_size_bytes,
+            )
+        else:
+            logger.info(
+                "Configured CXL size from extra_config.max_cxl_size: %d bytes",
+                cxl_size_bytes,
+            )
 
         # Initialize C library wrapper
         self.cxl_shm = CxlShmWrapper(num_procs=num_procs, rank=rank)
@@ -162,18 +217,8 @@ class CxlBackend(StorageBackendInterface):
         self.loop = loop
         self.use_local_cpu = config.local_cpu
 
-        # Get max CXL cache size from config
-        max_cxl_size_gb = 0.0
-        if config.extra_config is not None:
-            max_cxl_size_gb = config.extra_config.get("max_cxl_size", 0.0)
-        max_cxl_size_bytes = int(max_cxl_size_gb * 1024**3) if max_cxl_size_gb > 0 else 0
-        
-        # cxl_shm.c uses hardcoded 32GB (1UL << 35)
-        CXL_SHM_DAX_SIZE = 1 << 35  # 32GB
-        if max_cxl_size_bytes > 0:
-            self.max_cache_size = max_cxl_size_bytes
-        else:
-            self.max_cache_size = CXL_SHM_DAX_SIZE
+        # Keep Python-side accounting aligned with C mapping size.
+        self.max_cache_size = cxl_size_bytes
         self.current_cache_size = 0.0
 
         # to help maintain suffix -> prefix order in the dict
