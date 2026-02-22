@@ -248,6 +248,10 @@ __attribute__((visibility("default"))) int cxl_shm_init(int num_procs, int rank)
         fprintf(stderr, "Failed to allocate memory for mem_hash_t\n");
         return -1;
     }
+    // IMPORTANT:
+    // `mem_hash` uses `bucket_len` as per-level bucket size; effective addressable
+    // slots are sum(level buckets). Passing CXL_SHM_MAX_OBJS here would exceed the
+    // metadata array bounds. Keep the validated default profile (10 x ~200k ~= 2M).
     if (mem_hash_init(mh, 10, 200000)) {
         fprintf(stderr, "Failed to initialize mem_hash_t\n");
         return -1;

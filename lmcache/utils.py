@@ -415,6 +415,12 @@ class CacheStoreEvent:
     medium: str | None
 
 
+@dataclass
+class CacheRemoveEvent:
+    block_hashes: list[int]
+    medium: str | None
+
+
 ##### NVTX annotation #####
 _NVTX_COLORS = ["green", "blue", "purple", "rapids"]
 

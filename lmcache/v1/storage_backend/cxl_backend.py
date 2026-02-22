@@ -24,7 +24,13 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheRemoveEvent,
+    CacheStoreEvent,
+    DiskCacheMetadata,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata, TensorMemoryObj
@@ -136,9 +142,9 @@ class CxlBackend(StorageBackendInterface):
         os.environ["LMCACHE_CXL_DAX_DEVICE"] = dax_device
         logger.info(f"Using CXL DAX device: {dax_device}")
 
-        # Single source of truth for CXL size:
-        # - read from YAML extra_config.max_cxl_size
-        # - pass to C layer via env before cxl_shm_init()
+        # Single source for CXL size:
+        # - parse extra_config.max_cxl_size from YAML
+        # - pass it to C layer via env before cxl_shm_init()
         cxl_size_bytes, used_default_size = _resolve_cxl_device_size_bytes(config.extra_config)
         os.environ["LMCACHE_CXL_DAX_DEVICE_SIZE"] = str(cxl_size_bytes)
         if used_default_size:
@@ -201,13 +207,19 @@ class CxlBackend(StorageBackendInterface):
                         f"Failed to re-initialize CXL shared memory after full reset: {re_rc}"
                     )
         elif reset_mode == "metadata":
-            logger.warning(
-                "cxl_reset_on_init=metadata: resetting only CXL metadata/cursor "
-                "(existing objects become unreachable)"
-            )
-            md_rc = self.cxl_shm.reset_metadata()
-            if md_rc != 0:
-                raise RuntimeError(f"Failed to reset CXL metadata: {md_rc}")
+            if rank != 0:
+                logger.warning(
+                    "cxl_reset_on_init=metadata requested on non-zero rank=%d; skipping",
+                    rank,
+                )
+            else:
+                logger.warning(
+                    "cxl_reset_on_init=metadata: resetting only CXL metadata/cursor "
+                    "(existing objects become unreachable)"
+                )
+                md_rc = self.cxl_shm.reset_metadata()
+                if md_rc != 0:
+                    raise RuntimeError(f"Failed to reset CXL metadata: {md_rc}")
 
         # Store handles for each key
         self.key_handles: dict[CacheEngineKey, CxlShmHnd] = {}
@@ -228,6 +240,9 @@ class CxlBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self._kv_event_sink: Optional[
+            Callable[[CacheStoreEvent | CacheRemoveEvent], None]
+        ] = None
 
         # Template to infer metadata for objects created by other nodes.
         # Assumption: within a deployment, KV format/dtype/num_layers/hidden_dim
@@ -312,6 +327,11 @@ class CxlBackend(StorageBackendInterface):
 
     def __str__(self):
         return "CxlBackend"
+
+    def set_kv_event_sink(
+        self, sink: Callable[[CacheStoreEvent | CacheRemoveEvent], None]
+    ) -> None:
+        self._kv_event_sink = sink
 
     def _get_cxl_key(self, key: CacheEngineKey) -> str:
         """
@@ -490,6 +510,10 @@ class CxlBackend(StorageBackendInterface):
             self.lmcache_worker.put_msg(
                 KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
             )
+        if self._kv_event_sink is not None:
+            self._kv_event_sink(
+                CacheRemoveEvent(block_hashes=[key.chunk_hash], medium="CXL")
+            )
 
         return True
 
@@ -530,6 +554,18 @@ class CxlBackend(StorageBackendInterface):
         if self.lmcache_worker is not None and not has_stored:
             self.lmcache_worker.put_msg(
                 KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
+            )
+        if self._kv_event_sink is not None and not has_stored:
+            # Notify actual CXL residency; cache_engine will enrich parent/tokens.
+            self._kv_event_sink(
+                CacheStoreEvent(
+                    block_hashes=[key.chunk_hash],
+                    parent_block_hash=None,
+                    token_ids=[],
+                    block_size=int(self.chunk_size),
+                    lora_id=None,
+                    medium="CXL",
+                )
             )
 
     def submit_put_task(

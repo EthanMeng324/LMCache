@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
 import time
 
@@ -13,7 +13,12 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheRemoveEvent,
+    CacheStoreEvent,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lazy_memory_allocator import LazyMixedMemoryAllocator
@@ -77,6 +82,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.layerwise = config.use_layerwise
         self.enable_blending = config.enable_blending
+        self._kv_event_sink: Optional[
+            Callable[[CacheStoreEvent | CacheRemoveEvent], None]
+        ] = None
 
         # Store config and metadata for chunk budget calculation
         self.config = config
@@ -115,6 +123,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def __str__(self):
         return self.__class__.__name__
+
+    def set_kv_event_sink(
+        self, sink: Callable[[CacheStoreEvent | CacheRemoveEvent], None]
+    ) -> None:
+        self._kv_event_sink = sink
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.cpu_lock:
@@ -273,6 +286,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Now release the backend's ownership ref (added in submit_put_task()).
         for _, memory_obj in evicted_items:
             memory_obj.ref_count_down()
+        if self._kv_event_sink is not None:
+            self._kv_event_sink(
+                CacheRemoveEvent(block_hashes=[key.chunk_hash], medium="CPU")
+            )
         return True
 
     def batched_remove(
@@ -307,6 +324,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self._notify_evict(evicted_items)
         for _, memory_obj in evicted_items:
             memory_obj.ref_count_down()
+        if self._kv_event_sink is not None and evicted_items:
+            self._kv_event_sink(
+                CacheRemoveEvent(
+                    block_hashes=[k.chunk_hash for k, _ in evicted_items], medium="CPU"
+                )
+            )
         return num_removed
 
     def _calculate_effective_cpu_size(

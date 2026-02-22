@@ -56,7 +56,7 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate
+from lmcache.utils import CacheRemoveEvent, CacheStoreEvent, _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig, _validate_and_set_config_value
@@ -1989,7 +1989,7 @@ class LMCacheConnectorV1Impl:
         return False, return_params
 
     @_lmcache_nvtx_annotate
-    def get_kv_events(self) -> Iterable[CacheStoreEvent]:
+    def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheRemoveEvent]:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []

@@ -27,6 +27,7 @@ from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
+    CacheRemoveEvent,
     CacheStoreEvent,
     _lmcache_nvtx_annotate,
     convert_tokens_to_list,
@@ -187,8 +188,12 @@ class LMCacheEngine:
         self.kv_events_enabled = False
         self.kv_events_enabled = config.enable_kv_events
         if self.kv_events_enabled:
-            self.kv_events: List[CacheStoreEvent] = []
+            self.kv_events: List[CacheStoreEvent | CacheRemoveEvent] = []
             self._kv_event_tail_hash_by_req: Dict[str, int] = {}
+            # block_hash -> (parent_block_hash, token_ids, block_size, lora_id)
+            self._kv_store_meta_by_hash: Dict[int, Tuple[Optional[int], List[int], Optional[int], Optional[int]]] = {}
+            if self.storage_manager is not None:
+                self._register_backend_kv_event_sinks()
             logger.info("KV events are enabled.")
         else:
             logger.info("KV events are disabled.")
@@ -531,6 +536,7 @@ class LMCacheEngine:
                 medium="CPU",
             )
             self.kv_events.append(stored_event)
+            self._cache_store_event_metadata(stored_event)
             logger.info(
                 "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
                 "block_size=%d, parent_block_hash=%s",
@@ -550,6 +556,7 @@ class LMCacheEngine:
                 )
             if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
+
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
@@ -725,6 +732,7 @@ class LMCacheEngine:
                 medium="CPU",
             )
             self.kv_events.append(stored_event)
+            self._cache_store_event_metadata(stored_event)
             logger.info(
                 "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
                 "block_size=%d, parent_block_hash=%s",
@@ -744,6 +752,7 @@ class LMCacheEngine:
                 )
             if request_id is not None:
                 self._kv_event_tail_hash_by_req[request_id] = event_block_hashes[-1]
+
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -1456,11 +1465,91 @@ class LMCacheEngine:
         return self._clear(tokens, locations, request_configs)
 
     @_lmcache_nvtx_annotate
-    def get_kv_events(self) -> Iterable[CacheStoreEvent]:
+    def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheRemoveEvent]:
         if self.kv_events_enabled and (events := self.kv_events):
             self.kv_events = []
             return events
         return []
+
+    def _register_backend_kv_event_sinks(self) -> None:
+        assert self.storage_manager is not None
+        for backend in self.storage_manager.storage_backends.values():
+            setter = getattr(backend, "set_kv_event_sink", None)
+            if callable(setter):
+                setter(self._on_backend_kv_event)
+
+    def _compute_event_block_token_sizes(
+        self, num_blocks: int, block_size: int, token_ids_len: int
+    ) -> List[int]:
+        if num_blocks == 0:
+            return []
+        if block_size == 0:
+            sizes = [0 for _ in range(num_blocks)]
+            sizes[0] = token_ids_len
+            return sizes
+        sizes: List[int] = [0 for _ in range(num_blocks)]
+        remaining = token_ids_len
+        for idx in range(num_blocks):
+            if remaining <= 0:
+                sizes[idx] = 0
+                continue
+            take = min(remaining, block_size)
+            sizes[idx] = take
+            remaining -= take
+        return sizes
+
+    def _cache_store_event_metadata(self, event: CacheStoreEvent) -> None:
+        if not event.block_hashes:
+            return
+        block_sizes = self._compute_event_block_token_sizes(
+            num_blocks=len(event.block_hashes),
+            block_size=event.block_size,
+            token_ids_len=len(event.token_ids),
+        )
+        token_offset = 0
+        parent_hash = event.parent_block_hash
+        for idx, block_hash in enumerate(event.block_hashes):
+            take = block_sizes[idx] if idx < len(block_sizes) else 0
+            end = token_offset + take
+            block_tokens = event.token_ids[token_offset:end]
+            self._kv_store_meta_by_hash[int(block_hash)] = (
+                parent_hash,
+                block_tokens,
+                event.block_size,
+                event.lora_id,
+            )
+            token_offset = end
+            parent_hash = int(block_hash)
+
+    def _on_backend_kv_event(self, event: CacheStoreEvent | CacheRemoveEvent) -> None:
+        if not self.kv_events_enabled:
+            return
+        if isinstance(event, CacheStoreEvent) and (event.medium or "").upper() == "CXL":
+            for block_hash in event.block_hashes:
+                parent, token_ids, block_size, lora_id = self._kv_store_meta_by_hash.get(
+                    int(block_hash),
+                    (event.parent_block_hash, event.token_ids, event.block_size, event.lora_id),
+                )
+                cxl_event = CacheStoreEvent(
+                    block_hashes=[int(block_hash)],
+                    parent_block_hash=parent,
+                    token_ids=list(token_ids),
+                    block_size=int(block_size or event.block_size),
+                    lora_id=lora_id,
+                    medium="CXL",
+                )
+                self.kv_events.append(cxl_event)
+                logger.info(
+                    "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
+                    "block_size=%d, parent_block_hash=%s",
+                    None,
+                    len(cxl_event.block_hashes),
+                    cxl_event.medium or "unknown",
+                    cxl_event.block_size,
+                    cxl_event.parent_block_hash,
+                )
+            return
+        self.kv_events.append(event)
 
     def _clear(
         self,
