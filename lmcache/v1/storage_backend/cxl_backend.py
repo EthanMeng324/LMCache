@@ -406,6 +406,7 @@ class CxlBackend(StorageBackendInterface):
                     cached_positions=None,
                     fmt=fmt,
                     pin_count=0,
+                    shared=True,
                 )
                 meta = self.dict[key]
                 # Stored size is fixed (header + padded payload).
@@ -423,6 +424,14 @@ class CxlBackend(StorageBackendInterface):
                 meta.pin()
                 self.keys_in_request.append(key)
             return True
+
+    def is_shared_origin(self, key: CacheEngineKey) -> bool:
+        # Returns True iff the entry was first discovered via CXL SHM metadata
+        # without a local put — i.e. another node created it. Used by the cache
+        # engine to attribute CXL hits between local-origin and shared-origin.
+        with self.cxl_lock:
+            meta = self.dict.get(key)
+            return bool(meta is not None and getattr(meta, "shared", False))
 
     def touch_cache(self):
         # flip the order of the keys in the request
@@ -546,6 +555,7 @@ class CxlBackend(StorageBackendInterface):
                 cached_positions=None,
                 fmt=fmt,
                 pin_count=0,
+                shared=False,
             )
             # stored size (padding) is tracked separately for capacity accounting
             self._stored_sizes[key] = int(self._alloc_size_bytes(dtype, shape, fmt))

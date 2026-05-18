@@ -92,6 +92,11 @@ class DiskCacheMetadata:
     cached_positions: Optional[torch.Tensor] = None
     fmt: Optional[MemoryFormat] = None
     pin_count: int = 0
+    # True iff this entry was first observed via CXL SHM metadata without a
+    # local put — i.e. the object was created by another node and lazy-built
+    # into this backend's index on first contains(). Used to attribute CXL
+    # hits between local-origin and shared-origin.
+    shared: bool = False
 
     def pin(self) -> bool:
         self.pin_count += 1

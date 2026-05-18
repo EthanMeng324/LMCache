@@ -1726,6 +1726,12 @@ class LMCacheEngine:
         last_failed_block_start = None
         backend_hit_tokens = kwargs.get("backend_hit_tokens")
         hit_segments: list[tuple[str, int, int]] = []
+        # Resolve CxlBackend once per call so per-chunk attribution stays cheap.
+        cxl_backend_for_attr = (
+            self.storage_manager.storage_backends.get("CxlBackend")
+            if self.storage_manager is not None
+            else None
+        )
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
@@ -1736,6 +1742,7 @@ class LMCacheEngine:
                 "Failed to get memory objects from storage backend"
             )
 
+            is_cxl_location = str(location) == "CxlBackend"
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
                 if memory_obj is None:
                     logger.warning(
@@ -1753,7 +1760,14 @@ class LMCacheEngine:
                         last_failed_block_start = start
                     break
                 reordered_chunks.append((key, memory_obj, start, end))
-                hit_segments.append((str(location), int(start), int(end)))
+                # Attribute CXL hits between local- and shared-origin: a "shared"
+                # hit is a key that was first discovered via SHM metadata without
+                # a local put (i.e. another node created it). See CxlBackend.
+                attr_location = str(location)
+                if is_cxl_location and cxl_backend_for_attr is not None:
+                    if cxl_backend_for_attr.is_shared_origin(key):
+                        attr_location = "CxlBackend:shared"
+                hit_segments.append((attr_location, int(start), int(end)))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
 

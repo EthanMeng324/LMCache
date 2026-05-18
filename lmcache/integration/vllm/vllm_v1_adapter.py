@@ -138,11 +138,19 @@ def _enabled_backend_tiers(config: LMCacheEngineConfig) -> list[str]:
     extra = getattr(config, "extra_config", None) or {}
     if extra.get("cxl_dax_device") is not None:
         tiers.append("cxl")
+        # cxl_shared tracks hits on keys created by another node (lazy-built
+        # into this node's CxlBackend index from SHM metadata). cxl tracks
+        # hits on keys this node itself put. Sum equals total CXL hits.
+        tiers.append("cxl_shared")
     return tiers
 
 
 def _location_to_tier(location: str) -> Optional[str]:
     s = str(location)
+    # Order matters: "CxlBackend:shared" contains "CxlBackend" as a substring,
+    # so the shared variant must be checked first.
+    if "CxlBackend:shared" in s:
+        return "cxl_shared"
     if "CxlBackend" in s:
         return "cxl"
     if "LocalCPUBackend" in s:
