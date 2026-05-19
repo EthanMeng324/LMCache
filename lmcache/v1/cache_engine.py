@@ -1519,10 +1519,11 @@ class LMCacheEngine:
                 event.lora_id,
             )
             logger.info(
-                "META_STORE_CPU: chunk_hash=%d parent=%s tok_len=%d head=%s tail=%s",
+                "META_STORE_CPU: chunk_hash=%d parent=%s tok_len=%d fp=%d head=%s tail=%s",
                 int(block_hash),
                 parent_hash,
                 len(block_tokens),
+                hash(tuple(block_tokens)),
                 list(block_tokens[:4]),
                 list(block_tokens[-4:]) if len(block_tokens) >= 4 else list(block_tokens),
             )
@@ -1560,10 +1561,11 @@ class LMCacheEngine:
                 self.kv_events.append(cxl_event)
                 _emit_tokens = cxl_event.token_ids
                 logger.info(
-                    "META_READ_CXL: chunk_hash=%d parent=%s tok_len=%d head=%s tail=%s",
+                    "META_READ_CXL: chunk_hash=%d parent=%s tok_len=%d fp=%d head=%s tail=%s",
                     int(block_hash),
                     parent,
                     len(_emit_tokens),
+                    hash(tuple(_emit_tokens)),
                     list(_emit_tokens[:4]),
                     list(_emit_tokens[-4:]) if len(_emit_tokens) >= 4 else list(_emit_tokens),
                 )
