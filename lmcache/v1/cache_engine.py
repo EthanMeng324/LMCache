@@ -1526,10 +1526,21 @@ class LMCacheEngine:
             return
         if isinstance(event, CacheStoreEvent) and (event.medium or "").upper() == "CXL":
             for block_hash in event.block_hashes:
-                parent, token_ids, block_size, lora_id = self._kv_store_meta_by_hash.get(
-                    int(block_hash),
-                    (event.parent_block_hash, event.token_ids, event.block_size, event.lora_id),
-                )
+                meta = self._kv_store_meta_by_hash.get(int(block_hash))
+                if meta is None:
+                    logger.warning(
+                        "CXL_ENRICH_MISS: block_hash=%d had no CPU metadata; "
+                        "falling back to empty token_ids (this will cause tokens_hash mismatch in indexer). "
+                        "meta_map_size=%d",
+                        int(block_hash),
+                        len(self._kv_store_meta_by_hash),
+                    )
+                    parent = event.parent_block_hash
+                    token_ids = event.token_ids
+                    block_size = event.block_size
+                    lora_id = event.lora_id
+                else:
+                    parent, token_ids, block_size, lora_id = meta
                 cxl_event = CacheStoreEvent(
                     block_hashes=[int(block_hash)],
                     parent_block_hash=parent,
@@ -1732,6 +1743,30 @@ class LMCacheEngine:
             if self.storage_manager is not None
             else None
         )
+        # Build a per-call chain parent map so we can backfill
+        # _kv_store_meta_by_hash for chunks that get auto-cached into
+        # LocalCPUBackend via storage_manager.get_blocking (the CXL/Disk -> CPU
+        # back-fill path). Without this, those chunks have no metadata, and
+        # when they later get evicted and spilled back to CXL, the CXL
+        # CacheStoreEvent gets empty token_ids -> wrong tokens_hash -> indexer
+        # block_hash mismatch warnings.
+        #
+        # chunk_infos is in token order (from token_database.process_tokens)
+        # so we can derive each chunk's chain-parent as the previous chunk's
+        # chunk_hash. Only fill entries that don't already exist to avoid
+        # clobbering store-time records.
+        meta_record_enabled = (
+            self.kv_events_enabled
+            and tokens is not None
+            and hasattr(self, "_kv_store_meta_by_hash")
+        )
+        if meta_record_enabled:
+            chain_parent_by_key: dict[int, Optional[int]] = {}
+            prev_chunk_hash: Optional[int] = None
+            for ci_key, _, _ in chunk_infos:
+                chain_parent_by_key[int(ci_key.chunk_hash)] = prev_chunk_hash
+                prev_chunk_hash = int(ci_key.chunk_hash)
+
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
@@ -1770,6 +1805,29 @@ class LMCacheEngine:
                 hit_segments.append((attr_location, int(start), int(end)))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
+
+                # Backfill _kv_store_meta_by_hash for this chunk if it wasn't
+                # populated by a prior store(). The CXL/Disk -> CPU back-fill
+                # path in storage_manager.get_blocking caches chunks into
+                # LocalCPUBackend without going through cache_engine.store(),
+                # so without this backfill, downstream CXL spill events would
+                # be emitted with empty token_ids and cause hash mismatches in
+                # the router indexer.
+                if (
+                    meta_record_enabled
+                    and int(key.chunk_hash) not in self._kv_store_meta_by_hash
+                ):
+                    try:
+                        chunk_token_ids = convert_tokens_to_list(tokens, start, end)
+                    except Exception:
+                        chunk_token_ids = []
+                    if chunk_token_ids:
+                        self._kv_store_meta_by_hash[int(key.chunk_hash)] = (
+                            chain_parent_by_key.get(int(key.chunk_hash)),
+                            chunk_token_ids,
+                            int(end - start),
+                            None,
+                        )
 
         if last_failed_block_start is not None:
             ret_mask[last_failed_block_start:] = False
