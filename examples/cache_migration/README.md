@@ -42,7 +42,8 @@ cp libcxl_shm.so lmcache/v1/storage_backend/
 ```bash
 sudo -E env CUDA_VISIBLE_DEVICES=0 \
   LMCACHE_CONFIG_FILE=examples/cache_migration/migration_test.yaml \
-  ./venv/bin/vllm serve Qwen/Qwen2.5-7B-Instruct \
+  ./venv/bin/vllm serve /home/ucmerced/tmp/data/hf-cache/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
   --gpu-memory-utilization 0.8 \
   --port 8000 \
   --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' \
@@ -52,7 +53,7 @@ sudo -E env CUDA_VISIBLE_DEVICES=0 \
 curl http://localhost:8000/v1/completions \
 -H "Content-Type: application/json" \
 -d '{
-  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "model": "Qwen/Qwen3-14B",
   "prompt": "<|begin_of_text|><|system|>\nYou are a helpful AI assistant.\n<|user|>\nWhat is the capital of France?\n<|assistant|>",
   "max_tokens": 100,
   "temperature": 0.7
@@ -66,7 +67,7 @@ python3 benchmarks/multi_round_qa/multi-round-qa.py \
   --shared-system-prompt 10000 \
   --user-history-prompt 20000 \
   --answer-len 100 \
-  --model Qwen/Qwen2.5-7B-Instruct \
+  --model Qwen/Qwen3-14B \
   --base-url http://localhost:8000/v1
 
 输出diff
@@ -211,7 +212,8 @@ extra_config:
 CUDA_VISIBLE_DEVICES=0 \
 LMCACHE_CONFIG_FILE=migration_test.yaml \
 vllm serve \
-  Qwen/Qwen2.5-7B-Instruct \
+  /home/ucmerced/tmp/data/hf-cache/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
   --gpu-memory-utilization 0.8 \
   --port 8000 \
   --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
@@ -331,7 +333,7 @@ if cpu_backend:
 curl -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "model": "Qwen/Qwen3-14B",
     "prompt": "什么是机器学习？",
     "max_tokens": 50
   }'
@@ -341,7 +343,7 @@ for i in {1..10}; do
   curl -X POST http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "model": "Qwen/Qwen3-14B",
       "prompt": "什么是机器学习？",
       "max_tokens": 50
     }'
@@ -986,7 +988,7 @@ if migration_service is not None:
 (APIServer pid=772316) INFO 01-27 01:43:28 [loggers.py:248] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 309.9 tokens/s, Running: 169 reqs, Waiting: 491 reqs, GPU KV cache usage: 91.5%, Prefix cache hit rate: 31.7%, External prefix cache hit rate: 0.3%
 (EngineCore_DP0 pid=772517) [2026-01-27 01:43:28,406] LMCache ERROR: The number of tokens is more than the number of blocks for request chatcmpl-bc6c0e93818b4208. Something might be wrong in scheduling logic! (vllm_v1_adapter.py:401:lmcache.integration.vllm.vllm_v1_adapter)
 (EngineCore_DP0 pid=772517) [2026-01-27 01:43:28,406] LMCache ERROR: Num tokens: 3813, num blocks: 123, block size: 16 (vllm_v1_adapter.py:407:lmcache.integration.vllm.vllm_v1_adapter)
-(EngineCore_DP0 pid=772517) ERROR 01-27 01:43:28 [dump_input.py:72] Dumping input data for V1 LLM engine (v0.13.0) with config: model='Qwen/Qwen2.5-7B-Instruct', speculative_config=None, tokenizer='Qwen/Qwen2.5-7B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False), seed=0, served_model_name=Qwen/Qwen2.5-7B-Instruct, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '/home/ucmerced/.cache/vllm/torch_compile_cache/b448d1105a', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::kda_attention', 'vllm::sparse_attn_indexer'], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'eliminate_noops': True, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False}, 'local_cache_dir': '/home/ucmerced/.cache/vllm/torch_compile_cache/b448d1105a/rank_0_0/backbone'}, 
+(EngineCore_DP0 pid=772517) ERROR 01-27 01:43:28 [dump_input.py:72] Dumping input data for V1 LLM engine (v0.13.0) with config: model='Qwen/Qwen3-14B', speculative_config=None, tokenizer='Qwen/Qwen3-14B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False), seed=0, served_model_name=Qwen/Qwen3-14B, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '/home/ucmerced/.cache/vllm/torch_compile_cache/b448d1105a', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::kda_attention', 'vllm::sparse_attn_indexer'], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'eliminate_noops': True, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False}, 'local_cache_dir': '/home/ucmerced/.cache/vllm/torch_compile_cache/b448d1105a/rank_0_0/backbone'}, 
 (EngineCore_DP0 pid=772517) ERROR 01-27 01:43:28 [dump_input.py:79] Dumping scheduler output for model execution: SchedulerOutput(scheduled_new_reqs=[], scheduled_cached_reqs=CachedRequestData(req_ids=['chatcmpl-9fdc1ccb3b221908', 'chatcmpl-a844dffd67b1b61c', 'chatcmpl-bb0c326d6ad99db3', 'chatcmpl-a2f7eeb55b857d67', 'chatcmpl-9e81b5b2ad6b4bb8', 'chatcmpl-88f1c0d4b814cfc4', 'chatcmpl-8fc9fe99ddbbf981', 'chatcmpl-a874febf8a908c01', 'chat
 
 (EngineCore_DP0 pid=772517) ERROR 01-27 01:43:28 [core.py:868] EngineCore encountered a fatal error.

@@ -110,6 +110,13 @@
         "num_hidden_layers": 28,
         "num_key_value_heads": 4
     },
+    "Qwen/Qwen3-14B": {
+        "hidden_size": 5120,
+        "num_attention_heads": 40,
+        "num_hidden_layers": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128
+    },
     "Qwen/Qwen2.5-3B-Instruct": {
         "hidden_size": 2048,
         "num_attention_heads": 16,

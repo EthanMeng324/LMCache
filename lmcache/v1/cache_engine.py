@@ -1518,15 +1518,6 @@ class LMCacheEngine:
                 event.block_size,
                 event.lora_id,
             )
-            logger.info(
-                "META_STORE_CPU: chunk_hash=%d parent=%s tok_len=%d fp=%d head=%s tail=%s",
-                int(block_hash),
-                parent_hash,
-                len(block_tokens),
-                hash(tuple(block_tokens)),
-                list(block_tokens[:4]),
-                list(block_tokens[-4:]) if len(block_tokens) >= 4 else list(block_tokens),
-            )
             token_offset = end
             parent_hash = int(block_hash)
 
@@ -1559,16 +1550,6 @@ class LMCacheEngine:
                     medium="CXL",
                 )
                 self.kv_events.append(cxl_event)
-                _emit_tokens = cxl_event.token_ids
-                logger.info(
-                    "META_READ_CXL: chunk_hash=%d parent=%s tok_len=%d fp=%d head=%s tail=%s",
-                    int(block_hash),
-                    parent,
-                    len(_emit_tokens),
-                    hash(tuple(_emit_tokens)),
-                    list(_emit_tokens[:4]),
-                    list(_emit_tokens[-4:]) if len(_emit_tokens) >= 4 else list(_emit_tokens),
-                )
                 logger.info(
                     "Queued KV store event: req_id=%s, num_blocks=%d, medium=%s, "
                     "block_size=%d, parent_block_hash=%s",
@@ -1841,24 +1822,11 @@ class LMCacheEngine:
                     except Exception:
                         chunk_token_ids = []
                     if chunk_token_ids:
-                        _backfill_parent = chain_parent_by_key.get(int(key.chunk_hash))
                         self._kv_store_meta_by_hash[int(key.chunk_hash)] = (
-                            _backfill_parent,
+                            chain_parent_by_key.get(int(key.chunk_hash)),
                             chunk_token_ids,
                             int(end - start),
                             None,
-                        )
-                        logger.info(
-                            "META_STORE_BACKFILL: chunk_hash=%d parent=%s tok_len=%d "
-                            "head=%s tail=%s start=%d end=%d location=%s",
-                            int(key.chunk_hash),
-                            _backfill_parent,
-                            len(chunk_token_ids),
-                            list(chunk_token_ids[:4]),
-                            list(chunk_token_ids[-4:]) if len(chunk_token_ids) >= 4 else list(chunk_token_ids),
-                            int(start),
-                            int(end),
-                            str(location),
                         )
 
         if last_failed_block_start is not None:

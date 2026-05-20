@@ -20,7 +20,7 @@ except ImportError:
     sys.exit(1)
 
 
-def send_request(prompt: str, port: int = 8000, model: str = "Qwen/Qwen2.5-7B-Instruct"):
+def send_request(prompt: str, port: int = 8000, model: str = "Qwen/Qwen3-14B"):
     """Send a completion request to vLLM."""
     url = f"http://localhost:{port}/v1/completions"
     payload = {
@@ -72,8 +72,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-7B-Instruct",
-        help="Model name (default: Qwen/Qwen2.5-7B-Instruct)"
+        default="Qwen/Qwen3-14B",
+        help="Model name (default: Qwen/Qwen3-14B)"
     )
     
     args = parser.parse_args()
