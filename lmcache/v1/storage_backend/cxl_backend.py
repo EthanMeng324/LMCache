@@ -5,7 +5,11 @@ This backend maintains the Python StorageBackendInterface but uses
 the C implementation from cxl_shm.c for actual memory management.
 """
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence
 import asyncio
 import ctypes
 import itertools
@@ -36,14 +40,45 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.cxl_resource_governor import (
+    CxlResourceGovernor,
+    CxlResourceSnapshot,
+    CxlSharedResourceLock,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.cxl_shm_binding import CxlShmWrapper, CxlShmHnd
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.config import LMCacheEngineMetadata
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+
+def _with_cxl_priority(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a CXL backend operation under the local serving-priority gate."""
+
+    @wraps(method)
+    def wrapped(self: "CxlBackend", *args: Any, **kwargs: Any) -> Any:
+        with self._cxl_access():
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _with_background_cxl_priority(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Make a speculative CXL read best-effort and non-blocking."""
+
+    @wraps(method)
+    def wrapped(self: "CxlBackend", *args: Any, **kwargs: Any) -> Any:
+        with self.background_offload_slot() as admitted:
+            if not admitted:
+                self._prefetch_status.reason = "cxl_resource_busy"
+                return False
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 # Default DAX device path (from cxl_shm.c)
 DEFAULT_DAX_DEVICE = "/dev/dax1.0"
@@ -52,6 +87,33 @@ DEFAULT_CXL_DAX_SIZE_BYTES = 1 << 36  # 64GB
 
 # Constants from cxl_shm.h
 CXL_SHM_ONAME_LEN = 20  # Maximum object name length
+
+
+class CxlPutStatus(str, Enum):
+    """Outcome of one synchronous CXL write attempt.
+
+    Historically ``submit_put_task`` returned ``None`` for both success and
+    failure.  That is sufficient for best-effort write-back, but not for a
+    CPU->CXL offload controller which must never remove its CPU source unless
+    the CXL copy is known to exist.
+    """
+
+    SUCCESS = "success"
+    ALREADY_PRESENT = "already_present"
+    IN_PROGRESS = "in_progress"
+    DEFERRED = "deferred"
+    CAPACITY_REJECTED = "capacity_rejected"
+    IO_FAILED = "io_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class CxlPutResult:
+    status: CxlPutStatus
+    bytes_written: int = 0
+    detail: Optional[str] = None
+    # True means an existing local object is usable as this operation's
+    # prepare result, but still needs publish_keys() at commit time.
+    needs_publish: bool = False
 
 
 def _resolve_cxl_device_size_bytes(extra_config: Optional[dict[str, Any]]) -> tuple[int, bool]:
@@ -115,6 +177,7 @@ class CxlBackend(StorageBackendInterface):
         local_cpu_backend: LocalCPUBackend,
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
+        metadata: Optional["LMCacheEngineMetadata"] = None,
     ):
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
@@ -122,6 +185,13 @@ class CxlBackend(StorageBackendInterface):
         self.dst_device = dst_device
         self.local_cpu_backend = local_cpu_backend
         self.cxl_lock = threading.Lock()
+        # CXL is shared by the serving path and the best-effort CPU->CXL
+        # offload path.  Keep a separate local arbiter so an async offload
+        # thread cannot turn into an unprioritized CXL writer.
+        self.cxl_resource_governor = CxlResourceGovernor()
+        self._cxl_resource_context = threading.local()
+        # Per-executor-thread outcome for the bool-compatible prefetch API.
+        self._prefetch_status = threading.local()
         self.chunk_size = int(config.chunk_size)
 
         # Track actual bytes consumed in CXL per key (includes header + padding).
@@ -156,6 +226,33 @@ class CxlBackend(StorageBackendInterface):
             logger.info(
                 "Configured CXL size from extra_config.max_cxl_size: %d bytes",
                 cxl_size_bytes,
+            )
+
+        resource_lock_enabled = True
+        resource_lock_dir = None
+        if config.extra_config is not None:
+            raw_lock_enabled = config.extra_config.get(
+                "cxl_resource_lock_enabled", True
+            )
+            if isinstance(raw_lock_enabled, str):
+                resource_lock_enabled = raw_lock_enabled.strip().lower() not in {
+                    "0",
+                    "false",
+                    "off",
+                    "no",
+                }
+            else:
+                resource_lock_enabled = bool(raw_lock_enabled)
+            resource_lock_dir = config.extra_config.get("cxl_resource_lock_dir")
+        self.cxl_shared_resource_lock = CxlSharedResourceLock(
+            f"{dax_device}|{cxl_size_bytes}|{num_procs}",
+            lock_dir=resource_lock_dir,
+            enabled=resource_lock_enabled,
+        )
+        if resource_lock_enabled and not self.cxl_shared_resource_lock.enabled:
+            logger.warning(
+                "CXL process-shared payload lock is unavailable; using the "
+                "process-local serving-priority governor only"
             )
 
         # Initialize C library wrapper
@@ -225,6 +322,20 @@ class CxlBackend(StorageBackendInterface):
         self.key_handles: dict[CacheEngineKey, CxlShmHnd] = {}
         # Map from CacheEngineKey to CXL key (for long keys that use hash)
         self.key_to_cxl_key: dict[CacheEngineKey, str] = {}
+        # Process-local duplicate suppression for synchronous writes.  The C
+        # library still serializes create/destroy across processes; this set
+        # prevents two local offload jobs from both reserving capacity before
+        # either one has published Python metadata.
+        self._put_inflight: set[CacheEngineKey] = set()
+        # Track event publication independently from physical residency.  A
+        # successful offload publishes immediately, while a retry can repair
+        # a sink failure without allocating a duplicate native object.
+        self._published_keys: set[CacheEngineKey] = set()
+        # Native objects are fully written before insertion, but an explicit
+        # CPU-to-CXL prepare must not be reused by a second offload before its
+        # commit barrier. This local marker also lets an
+        # interrupted event publication be adopted by a later prepare.
+        self._prepared_keys: set[CacheEngineKey] = set()
 
         self.loop = loop
         self.use_local_cpu = config.local_cpu
@@ -251,6 +362,8 @@ class CxlBackend(StorageBackendInterface):
         self._kv_template_dtype: Optional[torch.dtype] = None
         self._kv_template_num_layers: Optional[int] = None
         self._kv_template_hidden_dim: Optional[int] = None
+        if metadata is not None:
+            self.set_kv_template_from_engine_metadata(metadata)
 
         # Lightweight logging for "how big is one CXL object".
         # Default: log the first few writes, then every N writes.
@@ -271,6 +384,58 @@ class CxlBackend(StorageBackendInterface):
     # to provide the KV "schema" early, without requiring a prior CXL write.
     def set_kv_template_from_memory_obj(self, memory_obj: MemoryObj) -> None:
         self._maybe_update_kv_template(memory_obj)
+
+    def set_kv_template_from_engine_metadata(
+        self, metadata: "LMCacheEngineMetadata"
+    ) -> None:
+        """Seed shared-object reconstruction from authoritative engine metadata.
+
+        A process-local CXL index starts empty. When a fresh replica discovers an
+        object written by another replica, native metadata provides its byte sizes
+        but not the tensor dtype/shape. Standard vLLM metadata is sufficient to
+        reconstruct the KV_2LTD schema without requiring this replica to perform a
+        local put first.
+        """
+        if metadata.use_mla:
+            logger.warning(
+                "Skipping CXL schema bootstrap from engine metadata for MLA; "
+                "shared-object reconstruction currently supports KV_2LTD only."
+            )
+            return
+
+        kv_shape = tuple(metadata.kv_shape)
+        if len(kv_shape) != 5 or int(kv_shape[1]) != 2:
+            logger.warning(
+                "Skipping CXL schema bootstrap for unexpected KV shape: %s",
+                kv_shape,
+            )
+            return
+
+        num_layers = int(kv_shape[0])
+        hidden_dim = int(kv_shape[3]) * int(kv_shape[4])
+        dtype = metadata.kv_dtype
+        if num_layers <= 0 or hidden_dim <= 0 or dtype is None:
+            logger.warning(
+                "Skipping CXL schema bootstrap for invalid engine metadata: "
+                "layers=%d hidden_dim=%d dtype=%s",
+                num_layers,
+                hidden_dim,
+                dtype,
+            )
+            return
+
+        self._kv_template_fmt = MemoryFormat.KV_2LTD
+        self._kv_template_dtype = dtype
+        self._kv_template_num_layers = num_layers
+        self._kv_template_hidden_dim = hidden_dim
+        logger.info(
+            "Initialized CXL shared KV schema from engine metadata: "
+            "fmt=%s dtype=%s layers=%d hidden_dim=%d",
+            self._kv_template_fmt,
+            self._kv_template_dtype,
+            self._kv_template_num_layers,
+            self._kv_template_hidden_dim,
+        )
 
     def _logical_size_bytes(self, dtype: Optional[torch.dtype], shape: torch.Size) -> int:
         if dtype is None:
@@ -328,6 +493,55 @@ class CxlBackend(StorageBackendInterface):
     def __str__(self):
         return "CxlBackend"
 
+    @contextmanager
+    def _cxl_access(self) -> Iterator[None]:
+        """Enter CXL access with serving priority.
+
+        ``background_offload_slot`` marks the current executor thread after it
+        has acquired the non-blocking background permit.  Nested backend calls
+        (for example ``get_blocking`` -> ``contains``) then reuse that permit
+        instead of acquiring it twice.
+        """
+
+        if getattr(self._cxl_resource_context, "background", False):
+            yield
+            return
+        with self.cxl_resource_governor.serving():
+            with self.cxl_shared_resource_lock.serving():
+                yield
+
+    @contextmanager
+    def background_offload_slot(self) -> Iterator[bool]:
+        """Try to reserve CXL for one bounded background offload chunk.
+
+        The context manager is intentionally non-blocking.  Callers should
+        release the slot after one chunk and retry later if ``False`` is
+        yielded.  This is the only supported entry point for background CXL
+        writes; normal ``submit_put_task`` calls remain serving-priority.
+        """
+
+        with self.cxl_resource_governor.try_background() as local_admitted:
+            if not local_admitted:
+                yield False
+                return
+
+            with self.cxl_shared_resource_lock.try_background() as admitted:
+                if not admitted:
+                    yield False
+                    return
+
+                previous = getattr(self._cxl_resource_context, "background", False)
+                self._cxl_resource_context.background = True
+                try:
+                    yield True
+                finally:
+                    self._cxl_resource_context.background = previous
+
+    def cxl_resource_snapshot(self) -> CxlResourceSnapshot:
+        """Return local serving/background arbitration counters."""
+
+        return self.cxl_resource_governor.snapshot()
+
     def set_kv_event_sink(
         self, sink: Callable[[CacheStoreEvent | CacheRemoveEvent], None]
     ) -> None:
@@ -358,6 +572,7 @@ class CxlBackend(StorageBackendInterface):
         self.key_to_cxl_key[key] = cxl_key
         return cxl_key
 
+    @_with_cxl_priority
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         # Multi-node access: objects may be created by other nodes, so `self.dict`
         # may not have the key yet. Use open_obj as the source of truth.
@@ -369,9 +584,12 @@ class CxlBackend(StorageBackendInterface):
                 self.dict.pop(key, None)
                 return False
             try:
+                # Both sizes must be read here: cxl_shm_close() NULLs hnd->obj,
+                # so any read after the finally below would silently yield 0.
                 actual_size = int(hnd.obj_contents.size)
-                if actual_size <= 0:
-                    self.dict.pop(key, None)
+                logical_size = int(getattr(hnd.obj_contents, "actual_size", 0))
+                if actual_size <= 0 or logical_size <= 0:
+                    self._published_keys.discard(key)
                     return False
                 # debug-only logging removed (timing-sensitive)
             finally:
@@ -384,7 +602,6 @@ class CxlBackend(StorageBackendInterface):
             meta = self.dict.get(key)
             if meta is None:
                 # First time seeing this key (likely created by another node).
-                logical_size = int(getattr(hnd.obj_contents, "actual_size", 0)) if hnd.obj_contents else 0
                 if logical_size <= 0 or logical_size > actual_size:
                     return False
 
@@ -440,6 +657,96 @@ class CxlBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
             self.keys_in_request = []
 
+    def _destroy_native_handle(
+        self,
+        hnd: CxlShmHnd,
+        *,
+        key: Optional[CacheEngineKey] = None,
+    ) -> bool:
+        """Destroy one native object and close its process-local handle."""
+        destroyed = False
+        try:
+            result = self.cxl_shm.destroy(hnd)
+            destroyed = result in (None, 0)
+            if not destroyed:
+                logger.warning(
+                    "Failed to destroy CXL object after rollback: key=%s result=%s",
+                    getattr(key, "chunk_hash", key),
+                    result,
+                )
+        except Exception:
+            logger.exception(
+                "Exception destroying CXL object after rollback: key=%s",
+                getattr(key, "chunk_hash", key),
+            )
+        finally:
+            try:
+                self.cxl_shm.close(hnd)
+            except Exception:
+                logger.debug(
+                    "Exception closing CXL rollback handle: key=%s",
+                    getattr(key, "chunk_hash", key),
+                    exc_info=True,
+                )
+        return destroyed
+
+    def _destroy_owned_native_handle(self, key: CacheEngineKey) -> bool:
+        """Destroy the native object owned by a completed local write."""
+        with self.cxl_lock:
+            hnd = self.key_handles.pop(key, None)
+        if hnd is None:
+            return False
+        return self._destroy_native_handle(hnd, key=key)
+
+    def _mark_native_ready(self, key: CacheEngineKey, logical_size: int) -> None:
+        """Make one fully copied native object visible to CXL readers."""
+        temporary = False
+        with self.cxl_lock:
+            hnd = self.key_handles.get(key)
+        if hnd is None:
+            result, hnd = self.cxl_shm.open_obj(self._get_cxl_key(key))
+            if result != 0 or hnd is None or not hnd.obj_contents:
+                raise RuntimeError(
+                    f"CXL object disappeared before publish: {getattr(key, 'chunk_hash', key)}"
+                )
+            temporary = True
+        try:
+            native_name = bytes(hnd.obj_contents.name).split(b"\0", 1)[0].decode(
+                "utf-8", errors="ignore"
+            )
+            if not hnd.obj_contents.in_use or native_name != self._get_cxl_key(key):
+                raise RuntimeError(
+                    f"CXL object handle is stale before publish: "
+                    f"expected={self._get_cxl_key(key)} actual={native_name}"
+                )
+            native_size = int(hnd.obj_contents.size)
+            if logical_size <= 0 or logical_size > native_size:
+                raise RuntimeError(
+                    f"Invalid CXL logical size for {getattr(key, 'chunk_hash', key)}: "
+                    f"logical={logical_size} native={native_size}"
+                )
+            current_size = int(getattr(hnd.obj_contents, "actual_size", 0))
+            if current_size == logical_size:
+                return
+            if current_size > 0:
+                raise RuntimeError(
+                    f"CXL object has conflicting logical size for "
+                    f"{getattr(key, 'chunk_hash', key)}: "
+                    f"current={current_size} requested={logical_size}"
+                )
+            result = self.cxl_shm.set_actual_size(hnd, logical_size)
+            if result not in (None, 0):
+                raise RuntimeError(
+                    f"Failed to publish CXL object for {getattr(key, 'chunk_hash', key)}: "
+                    f"{result}"
+                )
+        finally:
+            if temporary:
+                try:
+                    self.cxl_shm.close(hnd)
+                except Exception:
+                    pass
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         # Synchronous backend: no async put tasks.
         return False
@@ -466,6 +773,7 @@ class CxlBackend(StorageBackendInterface):
             else:
                 return False
 
+    @_with_cxl_priority
     def remove(
         self,
         key: CacheEngineKey,
@@ -475,13 +783,36 @@ class CxlBackend(StorageBackendInterface):
             self.cxl_lock.acquire()
 
         if not (meta := self.dict.pop(key, None)):
+            self._prepared_keys.discard(key)
+            self._published_keys.discard(key)
+            cxl_key = self._get_cxl_key(key)
+            hnd = self.key_handles.pop(key, None)
+            if hnd is None:
+                result, tmp_hnd = self.cxl_shm.open_obj(cxl_key)
+                if result == 0 and tmp_hnd is not None:
+                    hnd = tmp_hnd
+            destroyed = (
+                self._destroy_native_handle(hnd, key=key)
+                if hnd is not None
+                else False
+            )
             if force:
                 self.cxl_lock.release()
-            return False
+            return destroyed
 
+        # Prepared CPU->CXL objects are deliberately absent from the global
+        # admission stream.  Removing one during a transaction abort must not
+        # emit a remove event for an object that was never admitted.  A cold
+        # replica reconstructed from shared metadata is still considered
+        # externally visible and must retain the normal eviction events.
+        was_published = key in self._published_keys or bool(
+            getattr(meta, "shared", False)
+        )
         # meta.size is the logical payload size (bytes). Actual bytes consumed in CXL
         # may include header + padding; track via _stored_sizes.
         stored_size = int(self._stored_sizes.pop(key, int(meta.size)))
+        was_prepared = key in self._prepared_keys
+        self._prepared_keys.discard(key)
         cxl_key = self._get_cxl_key(key)
         
         # Destroy object in C library.
@@ -496,15 +827,47 @@ class CxlBackend(StorageBackendInterface):
             if result == 0 and tmp_hnd is not None:
                 hnd = tmp_hnd
 
+        destroyed = True
         if hnd is not None:
             try:
-                self.cxl_shm.destroy(hnd)
+                destroy_result = self.cxl_shm.destroy(hnd)
+                destroyed = destroy_result in (None, 0)
+                if not destroyed:
+                    logger.error(
+                        "Failed to destroy CXL object during remove: key=%s result=%s",
+                        getattr(key, "chunk_hash", key),
+                        destroy_result,
+                    )
+            except Exception:
+                destroyed = False
+                logger.exception(
+                    "Exception destroying CXL object during remove: key=%s",
+                    getattr(key, "chunk_hash", key),
+                )
             finally:
                 # close best-effort to avoid leaking mappings
                 try:
                     self.cxl_shm.close(hnd)
                 except Exception:
                     pass
+
+        if not destroyed:
+            # Do not report a successful removal, or drop Python accounting, if
+            # the native object is still potentially reachable.  Keeping the
+            # metadata here lets a later retry reopen and destroy the object;
+            # otherwise an abort would turn a failed native delete into an
+            # invisible CXL allocation.
+            self.dict[key] = meta
+            self._stored_sizes[key] = stored_size
+            if was_published:
+                self._published_keys.add(key)
+            if was_prepared:
+                self._prepared_keys.add(key)
+            if force:
+                self.cxl_lock.release()
+            return False
+
+        self._published_keys.discard(key)
 
         self.usage -= stored_size
         self.stats_monitor.update_local_storage_usage(self.usage)
@@ -515,18 +878,39 @@ class CxlBackend(StorageBackendInterface):
             self.cxl_lock.release()
 
         # push kv evict msg
-        if self.lmcache_worker is not None:
+        if was_published and self.lmcache_worker is not None:
             self.lmcache_worker.put_msg(
                 KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
             )
-        if self._kv_event_sink is not None:
+        if was_published and self._kv_event_sink is not None:
             self._kv_event_sink(
                 CacheRemoveEvent(block_hashes=[key.chunk_hash], medium="CXL")
             )
 
         return True
 
-    def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+    @_with_cxl_priority
+    def native_exists(self, key: CacheEngineKey) -> bool:
+        """Check native CXL residency without requiring Python metadata."""
+        with self.cxl_lock:
+            result, hnd = self.cxl_shm.open_obj(self._get_cxl_key(key))
+            if result != 0 or hnd is None or not hnd.obj_contents:
+                return False
+            try:
+                return bool(hnd.obj_contents.in_use)
+            finally:
+                try:
+                    self.cxl_shm.close(hnd)
+                except Exception:
+                    pass
+
+    def insert_key(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        *,
+        publish_events: bool = True,
+    ) -> None:
         # Learn template for cross-node reconstruction.
         self._maybe_update_kv_template(memory_obj)
         shape = memory_obj.metadata.shape
@@ -559,35 +943,114 @@ class CxlBackend(StorageBackendInterface):
             )
             # stored size (padding) is tracked separately for capacity accounting
             self._stored_sizes[key] = int(self._alloc_size_bytes(dtype, shape, fmt))
+            if publish_events:
+                self._prepared_keys.discard(key)
+            else:
+                self._prepared_keys.add(key)
 
-        # push kv admit msg
-        if self.lmcache_worker is not None and not has_stored:
-            self.lmcache_worker.put_msg(
-                KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
-            )
-        if self._kv_event_sink is not None and not has_stored:
-            # Notify actual CXL residency; cache_engine will enrich parent/tokens.
-            self._kv_event_sink(
-                CacheStoreEvent(
-                    block_hashes=[key.chunk_hash],
-                    parent_block_hash=None,
-                    token_ids=[],
-                    block_size=int(self.chunk_size),
-                    lora_id=None,
-                    medium="CXL",
-                )
-            )
+        if publish_events and not has_stored:
+            self.publish_keys([key])
 
+    def publish_keys(self, keys: Sequence[CacheEngineKey]) -> tuple[CacheEngineKey, ...]:
+        """Publish already-written CXL keys after a TP coordinator barrier."""
+        published: list[CacheEngineKey] = []
+        for key in dict.fromkeys(keys):
+            with self.cxl_lock:
+                if key not in self.dict:
+                    continue
+                if key in self._published_keys:
+                    published.append(key)
+                    continue
+                logical_size = int(self.dict[key].size)
+            try:
+                # The native metadata remains actual_size=0 through prepare.
+                # Only the commit path makes the object discoverable remotely.
+                self._mark_native_ready(key, logical_size)
+                with self.cxl_lock:
+                    self._published_keys.add(key)
+                if self.lmcache_worker is not None:
+                    self.lmcache_worker.put_msg(
+                        KVAdmitMsg(
+                            self.instance_id,
+                            key.worker_id,
+                            key.chunk_hash,
+                            str(self),
+                        )
+                    )
+                if self._kv_event_sink is not None:
+                    # cache_engine enriches this with parent/tokens using the
+                    # still-resident CPU source metadata.
+                    self._kv_event_sink(
+                        CacheStoreEvent(
+                            block_hashes=[key.chunk_hash],
+                            parent_block_hash=None,
+                            token_ids=[],
+                            block_size=int(self.chunk_size),
+                            lora_id=None,
+                            medium="CXL",
+                        )
+                    )
+                with self.cxl_lock:
+                    self._prepared_keys.discard(key)
+                published.append(key)
+            except Exception:
+                with self.cxl_lock:
+                    self._published_keys.discard(key)
+                raise
+        return tuple(published)
+
+    @_with_cxl_priority
     def submit_put_task(
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
-    ):
+        *,
+        publish_events: bool = True,
+    ) -> CxlPutResult:
         assert memory_obj.tensor is not None
-        # Synchronous backend: if already stored, skip repeated save.
+        existing = False
+        already_published = False
+        existing_is_prepared = False
+        existing_is_shared = False
         with self.cxl_lock:
             if key in self.dict:
-                return None
+                existing = True
+                already_published = key in self._published_keys
+                existing_is_prepared = key in self._prepared_keys
+                existing_is_shared = bool(
+                    getattr(self.dict[key], "shared", False)
+                )
+            if key in self._put_inflight:
+                return CxlPutResult(CxlPutStatus.IN_PROGRESS)
+            if not existing:
+                self._put_inflight.add(key)
+        if existing:
+            if existing_is_prepared:
+                return CxlPutResult(
+                    CxlPutStatus.IN_PROGRESS,
+                    detail="CXL object is prepared by another offload operation",
+                )
+            if already_published:
+                return CxlPutResult(CxlPutStatus.ALREADY_PRESENT)
+            if not publish_events:
+                return CxlPutResult(
+                    CxlPutStatus.ALREADY_PRESENT,
+                    needs_publish=not existing_is_shared,
+                )
+            if existing_is_shared:
+                return CxlPutResult(CxlPutStatus.ALREADY_PRESENT)
+            # A previous writer may have completed the native write but failed
+            # while notifying the event sink. Retry the publication before
+            # acknowledging an idempotent write; the router must not be told
+            # that a CXL copy is ready solely because the object exists.
+            try:
+                self.publish_keys([key])
+                return CxlPutResult(CxlPutStatus.ALREADY_PRESENT)
+            except Exception as exc:
+                logger.exception(
+                    "CXL event publication failed for existing key=%s", key
+                )
+                return CxlPutResult(CxlPutStatus.IO_FAILED, detail=str(exc))
 
         # Logical size written by caller (no allocator tail bytes).
         shape = memory_obj.metadata.shape
@@ -633,35 +1096,99 @@ class CxlBackend(StorageBackendInterface):
                 dtype,
                 shape,
             )
-        with self.cxl_lock:
-            # Check space (simplified - C library handles actual allocation)
-            while self.current_cache_size + required_size > self.max_cache_size:
-                evict_keys = self.cache_policy.get_evict_candidates(
-                    self.dict, num_candidates=1
-                )
-                if not evict_keys:
-                    logger.warning(
-                        "No eviction candidates found. CXL space under pressure."
+        reserved = False
+        write_succeeded = False
+        usage_added = False
+        try:
+            with self.cxl_lock:
+                while self.current_cache_size + required_size > self.max_cache_size:
+                    evict_keys = self.cache_policy.get_evict_candidates(
+                        self.dict, num_candidates=1
                     )
-                    return None
+                    if not evict_keys:
+                        logger.warning("No eviction candidates found. CXL space under pressure.")
+                        return CxlPutResult(CxlPutStatus.CAPACITY_REJECTED)
 
-                for evict_key in evict_keys:
-                    # subtract actual bytes consumed in CXL (padded alloc size)
-                    self.current_cache_size -= int(self._stored_sizes.get(evict_key, self.dict[evict_key].size))
+                    # remove(..., force=False) owns the single accounting
+                    # decrement.  Do not pre-decrement here: doing both made
+                    # current_cache_size drift below actual CXL usage.
+                    self.batched_remove(evict_keys, force=False)
+                self.current_cache_size += required_size
+                reserved = True
 
-                self.batched_remove(evict_keys, force=False)
-            self.current_cache_size += required_size
+            self.cache_policy.update_on_put(key)
+            buffer = memory_obj.byte_array
+            self.write_cxl_mmap(
+                key, buffer, payload_size=payload_size, alloc_size=alloc_size
+            )
+            write_succeeded = True
 
-        self.cache_policy.update_on_put(key)
-        buffer = memory_obj.byte_array
+            self.usage += required_size
+            usage_added = True
+            self.stats_monitor.update_local_storage_usage(self.usage)
+            self.insert_key(key, memory_obj, publish_events=publish_events)
+            return CxlPutResult(CxlPutStatus.SUCCESS, bytes_written=required_size)
+        except Exception as exc:
+            logger.exception("CXL put failed for key=%s", getattr(key, "chunk_hash", key))
+            cleaned = False
 
-        # Perform the write inline (memmove + flush happens in write_cxl_mmap).
-        self.write_cxl_mmap(key, buffer, payload_size=payload_size, alloc_size=alloc_size)
+            # Once write_cxl_mmap() returned, this call owns the native object.
+            # If insert_key() or event publication fails, remove the Python
+            # metadata and destroy that object instead of letting contains()
+            # turn a failed write into ALREADY_PRESENT.
+            if write_succeeded:
+                try:
+                    with self.cxl_lock:
+                        inserted = key in self.dict
+                    if inserted:
+                        cleaned = self.remove(key, force=True)
+                    if not cleaned:
+                        cleaned = self._destroy_owned_native_handle(key)
+                except Exception:
+                    logger.exception(
+                        "Failed to roll back CXL object after put failure for key=%s",
+                        getattr(key, "chunk_hash", key),
+                    )
+                    try:
+                        cleaned = self._destroy_owned_native_handle(key) or cleaned
+                    except Exception:
+                        logger.exception(
+                            "Failed to destroy owned CXL handle for key=%s",
+                            getattr(key, "chunk_hash", key),
+                        )
 
-        # Track usage and key metadata (synchronous completion).
-        self.usage += required_size
-        self.stats_monitor.update_local_storage_usage(self.usage)
-        self.insert_key(key, memory_obj)
+            if cleaned:
+                # remove() owns both accounting decrements when metadata was
+                # inserted.  Do not subtract the reservation a second time.
+                usage_added = False
+                reserved = False
+            else:
+                if usage_added:
+                    self.usage = max(0, self.usage - required_size)
+                    self.stats_monitor.update_local_storage_usage(self.usage)
+                if reserved:
+                    with self.cxl_lock:
+                        self.current_cache_size = max(
+                            0.0, self.current_cache_size - required_size
+                        )
+
+            # A concurrent process can win the native create race after this
+            # process performed its local precheck.  Only that pre-create
+            # failure path is allowed to use contains() for deduplication.
+            if not write_succeeded:
+                try:
+                    if self.contains(key):
+                        return CxlPutResult(CxlPutStatus.ALREADY_PRESENT)
+                except Exception:
+                    logger.debug(
+                        "Unable to inspect concurrent CXL writer for key=%s",
+                        getattr(key, "chunk_hash", key),
+                        exc_info=True,
+                    )
+            return CxlPutResult(CxlPutStatus.IO_FAILED, detail=str(exc))
+        finally:
+            with self.cxl_lock:
+                self._put_inflight.discard(key)
 
     def batched_submit_put_task(
         self,
@@ -672,82 +1199,134 @@ class CxlBackend(StorageBackendInterface):
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             self.submit_put_task(key, memory_obj)
 
+    @_with_background_cxl_priority
     def submit_prefetch_task(
         self,
         key: CacheEngineKey,
+        *,
+        task_id: Optional[str] = None,
+        ttl_ms: Optional[int] = None,
     ) -> bool:
         # Synchronous prefetch: best-effort read from CXL and cache into LocalCPUBackend.
         #
         # IMPORTANT: do not busy-loop on LocalCPU allocation here; under memory pressure
         # it can stall the engine. If LocalCPU can't allocate, we just skip prefetch.
-        assert self.use_local_cpu, "prefetch and local_cpu must be enabled together"
+        # Keep the reason on the worker thread so StorageManager can expose a
+        # useful completion counter without changing this long-standing bool API.
+        status = self._prefetch_status
+        status.reason = None
+
+        def fail(reason: str) -> bool:
+            status.reason = reason
+            return False
+
+        if not self.use_local_cpu:
+            return fail("backend_unavailable")
+        if self.local_cpu_backend is None:
+            return fail("backend_unavailable")
+        # A demand path may have filled the target between admission and
+        # execution.  Avoid rereading the shared object for an already-hot key.
+        if self.local_cpu_backend.contains(key):
+            return True
+        # ``dict`` is process-local.  A shared CXL mapping can contain an
+        # object created by another worker, so always let ``contains`` hydrate
+        # metadata before taking the read path.  This also makes the direct
+        # backend API safe (the engine promotion path already calls contains).
+        if not self.contains(key, pin=False):
+            return fail("missing_cxl")
         with self.cxl_lock:
-            if key not in self.dict:
-                return False
             self.cache_policy.update_on_hit(key, self.dict)
-            cxl_meta = self.dict[key]
+            cxl_meta = self.dict.get(key)
+            if cxl_meta is None:
+                return fail("metadata_missing")
             dtype = cxl_meta.dtype
             shape = cxl_meta.shape
             fmt = cxl_meta.fmt
 
-        assert dtype is not None
-        assert shape is not None
+        if dtype is None or shape is None:
+            return fail("metadata_missing")
 
         tmp_obj = self.load_bytes_from_cxl(key, dtype=dtype, shape=shape, fmt=fmt)
         if tmp_obj is None or tmp_obj.tensor is None:
-            return False
+            if tmp_obj is not None:
+                tmp_obj.ref_count_down()
+            return fail("cxl_read_failed")
 
         cached_obj = self.local_cpu_backend.allocate(
             shape,
             dtype,
             fmt,
-            eviction=True,
+            # Speculation is never allowed to evict demand-resident CPU KV.
+            eviction=False,
             busy_loop=False,
         )
         if cached_obj is None or cached_obj.tensor is None:
-            # Drop our temp ref (GC will reclaim underlying pinned tensor).
+            if cached_obj is not None:
+                cached_obj.ref_count_down()
             tmp_obj.ref_count_down()
+            return fail("cpu_capacity_rejected")
+
+        try:
+            cached_obj.tensor.copy_(tmp_obj.tensor, non_blocking=True)
+            expire_ns = None
+            if ttl_ms is not None and int(ttl_ms) > 0:
+                expire_ns = time.time_ns() + int(ttl_ms) * 1_000_000
+            if hasattr(self.local_cpu_backend, "submit_prefetch_put_task"):
+                self.local_cpu_backend.submit_prefetch_put_task(
+                    key, cached_obj, expire_ns=expire_ns
+                )
+            else:
+                self.local_cpu_backend.submit_put_task(key, cached_obj)
+        except Exception:
+            # Both objects are owned by this function until the backend admits
+            # cached_obj.  Always balance those references, including a failed
+            # tensor copy or backend admission.
+            status.reason = "cpu_admission_failed"
+            logger.debug(
+                "Reactive CXL prefetch admission failed for key %s",
+                getattr(key, "chunk_hash", key),
+                exc_info=True,
+            )
             return False
-
-        cached_obj.tensor.copy_(tmp_obj.tensor, non_blocking=True)
-        self.local_cpu_backend.submit_put_task(key, cached_obj)
-
-        # Release local refs; backend keeps its own for cached_obj.
-        cached_obj.ref_count_down()
-        tmp_obj.ref_count_down()
+        finally:
+            # Release local refs; a successful backend admission keeps its own
+            # reference to cached_obj.
+            cached_obj.ref_count_down()
+            tmp_obj.ref_count_down()
         return True
 
+    def get_prefetch_failure_reason(self) -> Optional[str]:
+        """Return the last failure reason on the calling worker thread."""
+        status = getattr(self, "_prefetch_status", None)
+        return None if status is None else getattr(status, "reason", None)
+
+    @_with_cxl_priority
     def get_blocking(
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
         """Blocking get function."""
-        self.cxl_lock.acquire()
-        if key not in self.dict:
-            if not self.contains(key, pin=False):
-                self.cxl_lock.release()
+        # contains() acquires cxl_lock and, for a cold replica, reconstructs the
+        # process-local metadata from the native shared object. Calling it while
+        # already holding this non-reentrant lock deadlocks on the cold path.
+        if not self.contains(key, pin=False):
+            return None
+
+        with self.cxl_lock:
+            cxl_meta = self.dict.get(key)
+            if cxl_meta is None:
                 return None
+            self.cache_policy.update_on_hit(key, self.dict)
 
-        self.cache_policy.update_on_hit(key, self.dict)
+            dtype = cxl_meta.dtype
+            shape = cxl_meta.shape
+            fmt = cxl_meta.fmt
+            assert dtype is not None
+            assert shape is not None
 
-        self.cxl_lock.release()
-
-        self.cxl_lock.acquire()
-        self.cache_policy.update_on_hit(key, self.dict)
-
-        cxl_meta = self.dict[key]
-        dtype = cxl_meta.dtype
-        shape = cxl_meta.shape
-        fmt = cxl_meta.fmt
-        assert dtype is not None
-        assert shape is not None
-
-        memory_obj = self.load_bytes_from_cxl(
-            key, dtype=dtype, shape=shape, fmt=fmt
-        )
-        self.cxl_lock.release()
-
-        return memory_obj
+            return self.load_bytes_from_cxl(
+                key, dtype=dtype, shape=shape, fmt=fmt
+            )
 
     def _batched_contains_prefix_blocking(
         self,
@@ -942,8 +1521,11 @@ class CxlBackend(StorageBackendInterface):
 
             # New actual_size path: take logical payload size from C metadata when present.
             meta_actual = int(getattr(hnd.obj_contents, "actual_size", 0))
-            if meta_actual > 0:
-                logical_size = meta_actual
+            if meta_actual <= 0:
+                # actual_size=0 is the native prepare marker. Never read an
+                # object whose payload has not crossed the CXL commit point.
+                return None
+            logical_size = meta_actual
 
             # debug-only logging removed (timing-sensitive)
 
@@ -957,11 +1539,16 @@ class CxlBackend(StorageBackendInterface):
                 )
                 return None
 
-            # Allocate pinned CPU buffer for the logical payload only.
-            # This can fail under pinned-memory pressure; treat as a cache miss.
+            # Allocate pinned CPU memory on GPU-capable workers.  A CUDA build
+            # of torch raises when pin_memory=True on a CPU-only host, so use a
+            # pageable staging buffer there (not a production GPU data path).
+            # Pinned allocation pressure on GPU workers remains a cache miss.
             try:
                 raw_data = torch.empty(
-                    logical_size, dtype=torch.uint8, device="cpu", pin_memory=True
+                    logical_size,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=torch.cuda.is_available(),
                 )
             except Exception:
                 # This is a common intermittent failure mode under host-pinned pressure.
@@ -1028,13 +1615,26 @@ class CxlBackend(StorageBackendInterface):
         size = int(alloc_size)
         cxl_key = self._get_cxl_key(key)
         
-        # Create object in C library
-        result, hnd = self.cxl_shm.create(cxl_key, size, actual_size=int(payload_size))
-        if result != 0 or hnd is None:
-            raise RuntimeError(f"Failed to create CXL object for key {cxl_key}: {result}")
-        
-        # Write data to mapped address
-        if hnd.mapped_addr:
+        hnd = None
+        stored_handle = False
+        try:
+            # Create object in C library.  The object is owned by this method
+            # until the complete payload has been copied and flushed.
+            result, hnd = self.cxl_shm.create(
+                cxl_key, size, actual_size=0
+            )
+            if result != 0 or hnd is None:
+                raise RuntimeError(
+                    f"Failed to create CXL object for key {cxl_key}: {result}"
+                )
+
+            if not hnd.mapped_addr:
+                raise RuntimeError(f"CXL object has no mapped address for key {cxl_key}")
+
+            # Write data to mapped address. The native object remains at
+            # actual_size=0 until publish_keys() marks the commit; it is
+            # destroyed on every exception after create(), including a failed
+            # flush.
             mapped_addr = hnd.mapped_addr
             # Layout: [payload][zero padding]
             #
@@ -1056,7 +1656,11 @@ class CxlBackend(StorageBackendInterface):
             except (TypeError, BufferError):
                 # Fallback: materialize bytes (extra copy) if buffer isn't writable/compatible.
                 buffer_bytes = bytes(buffer)
-                ctypes.memmove(ctypes.c_void_p(int(mapped_addr)), buffer_bytes, len(buffer_bytes))
+                ctypes.memmove(
+                    ctypes.c_void_p(int(mapped_addr)),
+                    buffer_bytes,
+                    len(buffer_bytes),
+                )
                 tail = int(size) - int(len(buffer_bytes))
                 if tail > 0:
                     ctypes.memset(
@@ -1064,13 +1668,27 @@ class CxlBackend(StorageBackendInterface):
                         0,
                         tail,
                     )
-            
+
             # Flush after write to guarantee persistence / visibility.
-            self.cxl_shm.flush(ctypes.c_void_p(mapped_addr), size)
-        
-        # Store handle
-        with self.cxl_lock:
-            self.key_handles[key] = hnd
+            flush_result = self.cxl_shm.flush(ctypes.c_void_p(mapped_addr), size)
+            if flush_result not in (None, 0):
+                raise RuntimeError(
+                    f"Failed to flush CXL object for key {cxl_key}: {flush_result}"
+                )
+
+            # Store handle only after the complete payload write succeeds.
+            with self.cxl_lock:
+                self.key_handles[key] = hnd
+                stored_handle = True
+        except Exception:
+            if stored_handle:
+                with self.cxl_lock:
+                    owned_hnd = self.key_handles.pop(key, None)
+                if owned_hnd is not None:
+                    hnd = owned_hnd
+            if hnd is not None:
+                self._destroy_native_handle(hnd, key=key)
+            raise
 
         cxl_write_time = time.time() - start_time
         logger.debug(
@@ -1122,6 +1740,7 @@ class CxlBackend(StorageBackendInterface):
                     logger.warning(f"Error closing handle for key {key}: {e}")
             self.key_handles.clear()
             self._stored_sizes.clear()
+            self._prepared_keys.clear()
 
         # Finalize C library
         if hasattr(self, "cxl_shm"):
@@ -1131,4 +1750,3 @@ class CxlBackend(StorageBackendInterface):
                 logger.warning(f"Error finalizing CXL shared memory: {e}")
 
         # Synchronous backend: no worker to close.
-

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING
 import asyncio
 import threading
@@ -14,8 +16,14 @@ from lmcache.logging import init_logger
 from lmcache.v1.cache_controller.message import (
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
+    AbortOffloadWorkerMsg,
+    AbortOffloadWorkerRetMsg,
     ClearWorkerMsg,
     ClearWorkerRetMsg,
+    CommitOffloadWorkerMsg,
+    CommitOffloadWorkerRetMsg,
+    FinalizeOffloadWorkerMsg,
+    FinalizeOffloadWorkerRetMsg,
     CompressWorkerMsg,
     CompressWorkerRetMsg,
     DecompressWorkerMsg,
@@ -27,7 +35,13 @@ from lmcache.v1.cache_controller.message import (
     HeartbeatMsg,
     MoveWorkerMsg,
     MoveWorkerRetMsg,
+    PrefetchWorkerMsg,
+    PrefetchWorkerRetMsg,
+    PrefetchStatusWorkerMsg,
+    PrefetchStatusWorkerRetMsg,
     Msg,
+    OffloadWorkerMsg,
+    OffloadWorkerRetMsg,
     PinWorkerMsg,
     PinWorkerRetMsg,
     RegisterMsg,
@@ -74,6 +88,13 @@ class LMCacheWorker:
         assert self.lmcache_instance_id is not None
         self.lmcache_engine = lmcache_engine
         self.worker_id = metadata.worker_id
+        # Keep background offload out of asyncio's shared default executor.
+        # Serving-side storage work can use that executor independently, while
+        # this bounded executor serializes control-plane offload attempts.
+        self._offload_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"lmcache-offload-{self.worker_id}",
+        )
 
         self.context = get_zmq_context()
 
@@ -298,7 +319,130 @@ class LMCacheWorker:
                 serialized_request = await self.reply_socket.recv()
                 request = msgspec.msgpack.decode(serialized_request, type=Msg)
                 logger.debug(f"Received message: {request}")
-                if isinstance(request, MoveWorkerMsg):
+                if isinstance(request, OffloadWorkerMsg):
+                    try:
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            self._offload_executor,
+                            partial(
+                                self.lmcache_engine.offload_to_backend,
+                                tokens=request.tokens,
+                                source_backend=request.source,
+                                target_backend=request.target,
+                                copy=request.copy,
+                                max_chunks=request.max_chunks,
+                                operation_id=request.event_id,
+                                publish_events=False,
+                                max_bytes=request.max_bytes,
+                            ),
+                        )
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            OffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=result.success,
+                                committed_chunks=result.committed_chunks,
+                                already_present_chunks=result.already_present_chunks,
+                                failed_chunks=result.failed_chunks,
+                                bytes_written=result.bytes_written,
+                                error=result.error,
+                            )
+                        )
+                    except Exception as exc:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            OffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=False,
+                                committed_chunks=0,
+                                already_present_chunks=0,
+                                failed_chunks=0,
+                                bytes_written=0,
+                                error=str(exc),
+                            )
+                        )
+                elif isinstance(request, CommitOffloadWorkerMsg):
+                    try:
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            self._offload_executor,
+                            partial(
+                                self.lmcache_engine.publish_pending_offload,
+                                request.event_id,
+                            ),
+                        )
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            CommitOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=result.success,
+                                published_chunks=result.committed_chunks,
+                                error=result.error,
+                            )
+                        )
+                    except Exception as exc:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            CommitOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=False,
+                                published_chunks=0,
+                                error=str(exc),
+                            )
+                        )
+                elif isinstance(request, AbortOffloadWorkerMsg):
+                    try:
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            self._offload_executor,
+                            partial(
+                                self.lmcache_engine.abort_pending_offload,
+                                request.event_id,
+                            ),
+                        )
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            AbortOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=result.success,
+                                removed_chunks=result.committed_chunks,
+                                error=result.error,
+                            )
+                        )
+                    except Exception as exc:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            AbortOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=False,
+                                removed_chunks=0,
+                                error=str(exc),
+                            )
+                        )
+                elif isinstance(request, FinalizeOffloadWorkerMsg):
+                    try:
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            self._offload_executor,
+                            partial(
+                                self.lmcache_engine.finalize_pending_offload,
+                                request.event_id,
+                            ),
+                        )
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            FinalizeOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=result.success,
+                                error=result.error,
+                            )
+                        )
+                    except Exception as exc:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            FinalizeOffloadWorkerRetMsg(
+                                event_id=request.event_id,
+                                worker_id=self.worker_id,
+                                success=False,
+                                error=str(exc),
+                            )
+                        )
+                elif isinstance(request, MoveWorkerMsg):
                     tokens = request.tokens
                     old_position = request.old_position
                     new_position = request.new_position
@@ -307,16 +451,25 @@ class LMCacheWorker:
 
                     # Intra node move
                     if new_position[0] == self.lmcache_worker_internal_url:
-                        # TODO(Jiayi): currently we only support moving from
-                        # local disk to local cpu.
-                        assert old_position[1] == "LocalDiskBackend"
+                        # NOTE: `old_position` is a backend-name str (set by
+                        # executor as msg.old_position[1]); `new_position` is a
+                        # (url, backend-name) tuple.
+                        assert old_position in ("CxlBackend", "LocalDiskBackend"), (
+                            f"Unsupported intra-node prefetch source: {old_position}"
+                        )
                         assert new_position[1] == "LocalCPUBackend"
                         assert do_copy
 
-                        # TODO(Jiayi): We need to align prefetch and move.
-                        logger.debug("Executing prefetch operation.")
-                        raise NotImplementedError(
-                            "Prefetch from controller is not implemented yet."
+                        logger.debug(
+                            "Executing intra-node prefetch: %s -> LocalCPUBackend",
+                            old_position,
+                        )
+                        num_tokens = self.lmcache_engine.move_intra_node(
+                            tokens=tokens,
+                            old_position=old_position,
+                            new_position=new_position,
+                            event_id=worker_event_id,
+                            do_copy=do_copy,
                         )
                     else:
                         assert new_position[1] == "LocalCPUBackend", (
@@ -337,6 +490,72 @@ class LMCacheWorker:
                     serialized_ret_msg = msgspec.msgpack.encode(
                         MoveWorkerRetMsg(num_tokens=num_tokens)
                     )
+                elif isinstance(request, PrefetchWorkerMsg):
+                    if not request.tokens and request.request_id:
+                        cancelled = self.lmcache_engine.cancel_prefetch_hint(
+                            request.request_id, request.route_epoch
+                        )
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            PrefetchWorkerRetMsg(
+                                accepted=0,
+                                scheduled=0,
+                                cancelled=cancelled,
+                            )
+                        )
+                    else:
+                        current_epoch = self.lmcache_engine._prefetch_route_epochs.get(
+                            request.request_id or "", -1
+                        )
+                        if request.request_id and request.route_epoch < current_epoch:
+                            serialized_ret_msg = msgspec.msgpack.encode(
+                                PrefetchWorkerRetMsg(
+                                    accepted=0,
+                                    scheduled=0,
+                                    stale=True,
+                                )
+                            )
+                        else:
+                            scheduled = self.lmcache_engine.prefetch_tokens(
+                                request.tokens,
+                                request_id=request.request_id,
+                                route_epoch=request.route_epoch,
+                                deadline_ns=request.deadline_ns,
+                                priority=request.priority,
+                                max_prefetch_bytes=request.max_prefetch_bytes,
+                                task_id=request.task_id,
+                                start_chunk=request.start_chunk,
+                                end_chunk=request.end_chunk,
+                                ttl_ms=request.ttl_ms,
+                            )
+                            serialized_ret_msg = msgspec.msgpack.encode(
+                                PrefetchWorkerRetMsg(
+                                    accepted=scheduled,
+                                    scheduled=scheduled,
+                                )
+                            )
+                elif isinstance(request, PrefetchStatusWorkerMsg):
+                    status = self.lmcache_engine.prefetch_status(request.task_id)
+                    if status is None:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            PrefetchStatusWorkerRetMsg(
+                                worker_event_id=request.worker_event_id,
+                                task_id=request.task_id,
+                                state="UNKNOWN",
+                            )
+                        )
+                    else:
+                        serialized_ret_msg = msgspec.msgpack.encode(
+                            PrefetchStatusWorkerRetMsg(
+                                worker_event_id=request.worker_event_id,
+                                task_id=request.task_id,
+                                state=str(status.get("state", "UNKNOWN")),
+                                requested_chunks=int(status.get("requested_chunks", 0) or 0),
+                                ready_chunks=int(status.get("ready_chunks", 0) or 0),
+                                bytes_copied=int(status.get("bytes_copied", 0) or 0),
+                                started_ns=status.get("started_ns"),
+                                completed_ns=status.get("completed_ns"),
+                            )
+                        )
                 elif isinstance(request, CompressWorkerMsg):
                     num_compressed_tokens = self.lmcache_engine.compress(
                         tokens=request.tokens,
@@ -361,7 +580,7 @@ class LMCacheWorker:
                     num_pinned_tokens = self.lmcache_engine.lookup(
                         tokens=request.tokens,
                         search_range=[request.location],
-                        request_id=request.worker_event_id,
+                        lookup_id=request.worker_event_id,
                         pin=True,
                     )
                     serialized_ret_msg = msgspec.msgpack.encode(
@@ -416,5 +635,6 @@ class LMCacheWorker:
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread.is_alive():
             self.thread.join()
+        self._offload_executor.shutdown(wait=True, cancel_futures=True)
         close_zmq_socket(self.push_socket)
         close_zmq_socket(self.reply_socket)

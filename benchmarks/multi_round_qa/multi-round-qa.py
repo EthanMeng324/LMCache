@@ -46,6 +46,9 @@ class WorkloadConfig:
     # Whether to include user id in request header
     enable_user_id: bool
 
+    # Send a stable session id through vLLM's kv_transfer_params.
+    enable_lmcache_session_id: bool = False
+
     # Whether strictly cap active sessions at num_users
     enforce_strict_concurrent_users: bool = False
 
@@ -76,6 +79,9 @@ class UserConfig:
     # Whether to include user id in request header
     enable_user_id: bool
 
+    # Send a stable session id through vLLM's kv_transfer_params.
+    enable_lmcache_session_id: bool
+
     @staticmethod
     def new_user_config(user_id: int, workload_config: WorkloadConfig) -> "UserConfig":
         return UserConfig(
@@ -86,6 +92,7 @@ class UserConfig:
             gap_between_requests=workload_config.num_users / workload_config.qps,
             num_rounds=workload_config.num_rounds,
             enable_user_id=workload_config.enable_user_id,
+            enable_lmcache_session_id=workload_config.enable_lmcache_session_id,
         )
 
 
@@ -131,7 +138,9 @@ class RequestExecutor:
         self.model = model
         self.loop = AsyncLoopWrapper.GetOrStartLoop()
 
-    async def _async_launch_request(self, messages, max_tokens, extra_headers=None):
+    async def _async_launch_request(
+        self, messages, max_tokens, extra_headers=None, extra_body=None
+    ):
         start_time = time.time()
         first_token_time = None
         words = ""
@@ -144,6 +153,7 @@ class RequestExecutor:
             max_tokens=max_tokens,
             stream_options={"include_usage": True},
             extra_headers=extra_headers,
+            extra_body=extra_body,
         )
 
         async for tok in response:
@@ -173,6 +183,7 @@ class RequestExecutor:
         max_tokens: int,
         finish_callback,
         extra_headers=None,
+        extra_body=None,
     ):
         """
         finish_callback: Callable[[Response], None]
@@ -180,7 +191,9 @@ class RequestExecutor:
         messages = chat_history.get_messages_for_openai()
         real_callback = lambda x: finish_callback(x.result())
         future = asyncio.run_coroutine_threadsafe(
-            self._async_launch_request(messages, max_tokens, extra_headers),
+            self._async_launch_request(
+                messages, max_tokens, extra_headers, extra_body
+            ),
             self.loop,
         )
         future.add_done_callback(real_callback)
@@ -292,11 +305,19 @@ class UserSession:
         else:
             max_tokens = self.user_config.answer_len
         if request_executor is not None:
+            extra_body = None
+            if self.user_config.enable_lmcache_session_id:
+                extra_body = {
+                    "kv_transfer_params": {
+                        "lmcache.session_id": str(self.user_config.user_id)
+                    }
+                }
             request_executor.launch_request(
                 self.chat_history,
                 max_tokens,
                 self._on_request_finished,
                 extra_headers={"x-user-id": str(self.user_config.user_id)},
+                extra_body=extra_body,
             )
             self.has_unfinished_request = True
         else:  # dry-run
@@ -376,6 +397,8 @@ class UserSessionManager:
         workload_config: WorkloadConfig,
         init_user_id=0,
         use_sharegpt=False,
+        sharegpt_path="ShareGPT.json",
+        trace_limit=None,
     ):
         self.workload_config = workload_config
         self.sessions: list[UserSession] = []
@@ -403,7 +426,7 @@ class UserSessionManager:
 
         self.use_sharegpt = use_sharegpt
         if self.use_sharegpt:
-            self._load_sharegpt_data()
+            self._load_sharegpt_data(sharegpt_path, trace_limit)
 
         self.enforce_strict_concurrent_users = (
             workload_config.enforce_strict_concurrent_users
@@ -420,9 +443,11 @@ class UserSessionManager:
             self.sessions
         ) == 0
 
-    def _load_sharegpt_data(self):
-        with open("ShareGPT.json", "r", encoding="utf-8") as file:
+    def _load_sharegpt_data(self, sharegpt_path, trace_limit=None):
+        with open(sharegpt_path, "r", encoding="utf-8") as file:
             self.sharegpt_data = json.load(file)
+        if trace_limit is not None and trace_limit > 0:
+            self.sharegpt_data = self.sharegpt_data[:trace_limit]
         self.sharegpt_data = [
             d
             for d in self.sharegpt_data
@@ -470,8 +495,9 @@ class UserSessionManager:
         self.total_users_created += 1
         user_config = UserConfig.new_user_config(self.user_id, self.workload_config)
         if self.use_sharegpt:
+            trace_index = self.total_users_created - 1
             user_session = UserSession(
-                user_config, self.use_sharegpt, self.sharegpt_data[self.user_id]
+                user_config, self.use_sharegpt, self.sharegpt_data[trace_index]
             )
         else:
             user_session = UserSession(user_config, self.use_sharegpt)
@@ -760,6 +786,14 @@ def parse_arguments():
         help="Whether to enable user id in the request headers",
     )
     parser.add_argument(
+        "--send-lmcache-session-id",
+        action="store_true",
+        help=(
+            "Send each benchmark user's stable id as "
+            "kv_transfer_params.lmcache.session_id"
+        ),
+    )
+    parser.add_argument(
         "--log-interval",
         type=int,
         default=30,
@@ -775,6 +809,18 @@ def parse_arguments():
         "--sharegpt",
         action="store_true",
         help="Whether to use ShareGPT dataset",
+    )
+    parser.add_argument(
+        "--sharegpt-trace",
+        type=str,
+        default="ShareGPT.json",
+        help="Path to the ShareGPT-format real service trace",
+    )
+    parser.add_argument(
+        "--trace-limit",
+        type=int,
+        default=None,
+        help="Maximum number of trace conversations to load",
     )
     parser.add_argument(
         "--dry-run",
@@ -845,6 +891,7 @@ def main():
         qps=args.qps,
         model=args.model,
         enable_user_id=args.request_with_user_id,
+        enable_lmcache_session_id=args.send_lmcache_session_id,
         enforce_strict_concurrent_users=args.enforce_strict_concurrent_users,
         disable_ramp_up=args.disable_ramp_up,
     )
@@ -853,6 +900,8 @@ def main():
         workload_config,
         init_user_id=args.init_user_id,
         use_sharegpt=args.sharegpt,
+        sharegpt_path=args.sharegpt_trace,
+        trace_limit=args.trace_limit,
     )
 
     num_steps = 0
@@ -880,7 +929,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Interrupted, waiting for the final result")
 
-    AsyncLoopWrapper.StopLoop()
+    if executor is not None:
+        AsyncLoopWrapper.StopLoop()
 
     logger.info(f"Finished benchmarking, dumping summary to {args.output}")
     summary = manager.summary(0, time.time())

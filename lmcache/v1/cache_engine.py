@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -15,7 +17,10 @@ from typing import (
 import asyncio
 import gc
 import multiprocessing
+import threading
 import time
+import uuid
+from contextlib import nullcontext
 
 # Third Party
 import torch
@@ -50,6 +55,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     PagedTensorMemoryAllocator,
     TensorMemoryObj,
 )
+from lmcache.v1.prefetch import PrefetchContext
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -67,8 +73,322 @@ ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 
 
+def _select_cxl_prefetch_keys(
+    token_database: TokenDatabase,
+    tokens: Iterable[int] | torch.Tensor,
+    max_chunks: int,
+    candidate_block_indices: Optional[Iterable[int]] = None,
+) -> list[CacheEngineKey]:
+    """Build bounded CXL-promotion keys, including sparse prefix positions.
+
+    Prefix hashes are cumulative, so ``process_tokens`` must still walk every
+    chunk before the furthest candidate.  The candidate index set prevents
+    local/GPU blocks between CXL blocks from being submitted as promotions.
+    ``None`` preserves the legacy contiguous-front behavior for older callers.
+    """
+    if max_chunks <= 0:
+        return []
+
+    requested_indices = (
+        None
+        if candidate_block_indices is None
+        else {max(0, int(index)) for index in candidate_block_indices}
+    )
+    if requested_indices is not None and not requested_indices:
+        return []
+
+    target_count = (
+        max_chunks
+        if requested_indices is None
+        else min(len(requested_indices), max_chunks)
+    )
+    keys: list[CacheEngineKey] = []
+    for chunk_index, (_, _, key) in enumerate(
+        token_database.process_tokens(tokens=tokens, mask=None)
+    ):
+        assert isinstance(key, CacheEngineKey)
+        if requested_indices is not None and chunk_index not in requested_indices:
+            continue
+        keys.append(key)
+        if len(keys) >= target_count:
+            break
+    return keys
+
+
 class CacheEngineEndSignal:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionResult:
+    requested: int
+    promoted: tuple[CacheEngineKey, ...]
+    already_present: tuple[CacheEngineKey, ...]
+    source_missing: tuple[CacheEngineKey, ...]
+    failed: tuple[CacheEngineKey, ...]
+    bytes_promoted: int
+
+
+@dataclass(frozen=True, slots=True)
+class BackendOffloadResult:
+    """One worker's bounded CPU-to-backend offload result."""
+
+    success: bool
+    committed_chunks: int
+    already_present_chunks: int
+    failed_chunks: int
+    bytes_written: int
+    error: Optional[str] = None
+
+
+class _CxlPrefetchExecutor:
+    """Worker-local data-plane executor for router-owned global prefetch.
+
+    This class intentionally contains no predictor, session state, or pattern
+    table.  Dynamo owns those decisions globally; LMCache only translates the
+    full token sequence into rank-local keys and performs a bounded CXL to CPU
+    copy.
+    """
+
+    _SOURCE = "CxlBackend"
+    _TARGET = "LocalCPUBackend"
+
+    @classmethod
+    def maybe_create(
+        cls, engine: "LMCacheEngine", config: LMCacheEngineConfig
+    ) -> Optional["_CxlPrefetchExecutor"]:
+        extra = config.extra_config or {}
+        # Prediction and admission are router-owned.  LMCache is enabled only
+        # when the explicit global flag is set; the former worker-local
+        # association/cxl flags are intentionally no longer activation paths.
+        enabled = bool(extra.get("cxl_global_prefetch_enabled", False))
+        if not enabled or engine.storage_manager is None:
+            return None
+        backends = engine.storage_manager.storage_backends
+        if cls._SOURCE not in backends or cls._TARGET not in backends:
+            logger.warning(
+                "Global CXL prefetch requires CxlBackend and LocalCPUBackend; disabled."
+            )
+            return None
+        return cls(engine, extra)
+
+    def __init__(self, engine: "LMCacheEngine", extra: dict) -> None:
+        self.engine = engine
+        self.max_chunks = max(
+            1,
+            int(
+                extra.get(
+                    "cxl_global_prefetch_max_chunks",
+                    8,
+                )
+            ),
+        )
+        self.max_inflight = max(
+            1,
+            int(
+                extra.get(
+                    "cxl_global_prefetch_workers",
+                    2,
+                )
+            ),
+        )
+        self.max_inflight_bytes = max(
+            1,
+            int(
+                extra.get(
+                    "cxl_global_prefetch_max_inflight_bytes",
+                    128 * 1024**2,
+                )
+            ),
+        )
+        self.chunk_bytes = 1
+        for dimension in engine.metadata.kv_shape:
+            self.chunk_bytes *= int(dimension)
+        self.chunk_bytes *= torch.empty(
+            (), dtype=engine.metadata.kv_dtype
+        ).element_size()
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_inflight,
+            thread_name_prefix="lmcache-global-prefetch",
+        )
+        self._lock = threading.Lock()
+        self._inflight_bytes = 0
+        self._inflight_keys: set[CacheEngineKey] = set()
+        self._request_futures: dict[str, set[Any]] = {}
+        self._route_epochs: dict[str, int] = {}
+        self._task_status: dict[str, dict[str, int | str | None]] = {}
+        self._max_task_status = max(128, self.max_inflight * 256)
+        self._closed = False
+        self.scheduled = 0
+        self.promoted = 0
+        self.failed = 0
+        logger.info(
+            "LMCache global prefetch executor enabled (max_chunks=%d, workers=%d, "
+            "max_inflight_bytes=%d)",
+            self.max_chunks,
+            self.max_inflight,
+            self.max_inflight_bytes,
+        )
+
+    def prefetch_keys(
+        self,
+        keys: Iterable[CacheEngineKey],
+        *,
+        request_id: Optional[str] = None,
+        route_epoch: int = 0,
+        deadline_ns: Optional[int] = None,
+        priority: int = 0,
+        max_prefetch_bytes: Optional[int] = None,
+        task_id: Optional[str] = None,
+    ) -> int:
+        unique = list(dict.fromkeys(keys))
+        if not unique:
+            return 0
+        if deadline_ns is not None and time.time_ns() >= deadline_ns:
+            return 0
+        if request_id:
+            with self._lock:
+                previous = self._route_epochs.get(request_id, -1)
+                if route_epoch < previous:
+                    return 0
+                self._route_epochs[request_id] = route_epoch
+                while len(self._route_epochs) > self._max_task_status:
+                    self._route_epochs.pop(next(iter(self._route_epochs)))
+        byte_limit = min(
+            self.max_inflight_bytes,
+            max_prefetch_bytes if max_prefetch_bytes is not None else self.max_inflight_bytes,
+        )
+        accepted: list[CacheEngineKey] = []
+        reserved = 0
+        with self._lock:
+            if self._closed:
+                return 0
+            for key in unique:
+                if len(accepted) >= self.max_chunks:
+                    break
+                if key in self._inflight_keys:
+                    continue
+                if reserved + self.chunk_bytes > byte_limit:
+                    break
+                accepted.append(key)
+                reserved += self.chunk_bytes
+            if not accepted or self._inflight_bytes + reserved > self.max_inflight_bytes:
+                return 0
+            self._inflight_bytes += reserved
+            self._inflight_keys.update(accepted)
+            self.scheduled += len(accepted)
+        event_id = f"global-prefetch-{request_id or uuid.uuid4().hex[:12]}"
+        logical_task_id = task_id or event_id
+        with self._lock:
+            while len(self._task_status) >= self._max_task_status:
+                self._task_status.pop(next(iter(self._task_status)))
+            self._task_status[logical_task_id] = {
+                "task_id": logical_task_id,
+                "state": "SUBMITTED",
+                "requested_chunks": len(accepted),
+                "ready_chunks": 0,
+                "bytes_copied": 0,
+                "started_ns": time.time_ns(),
+                "completed_ns": None,
+            }
+        try:
+            future = self._executor.submit(
+                self.engine.promote_keys_intra_node,
+                accepted,
+                self._SOURCE,
+                self._TARGET,
+                event_id,
+                do_copy=True,
+                max_chunks=self.max_chunks,
+                allow_eviction=False,
+            )
+            if request_id:
+                with self._lock:
+                    self._request_futures.setdefault(request_id, set()).add(future)
+            future.add_done_callback(
+                lambda done: self._done(
+                    done, accepted, reserved, request_id, logical_task_id
+                )
+            )
+        except Exception:
+            self._release(accepted, reserved, request_id)
+            logger.exception("Failed to submit global CXL prefetch task")
+            return 0
+        return len(accepted)
+
+    def _done(
+        self,
+        future: Any,
+        keys: list[CacheEngineKey],
+        reserved: int,
+        request_id: Optional[str],
+        task_id: str,
+    ) -> None:
+        try:
+            result = future.result()
+            with self._lock:
+                self.promoted += len(result.promoted)
+                self.failed += len(result.failed) + len(result.source_missing)
+                status = self._task_status.get(task_id)
+                if status is not None:
+                    # A duplicate hint is a successful no-op when the target
+                    # object reached LocalCPU between admission and execution.
+                    # Count already-present chunks as ready; otherwise the
+                    # router would observe FAILED, release its reservation,
+                    # and retrigger the same physical work on every request.
+                    ready_chunks = len(result.promoted) + len(result.already_present)
+                    status.update(
+                        state="READY" if ready_chunks == len(keys) else "FAILED",
+                        ready_chunks=ready_chunks,
+                        bytes_copied=int(result.bytes_promoted),
+                        completed_ns=time.time_ns(),
+                    )
+        except Exception:
+            with self._lock:
+                self.failed += len(keys)
+                status = self._task_status.get(task_id)
+                if status is not None:
+                    status.update(state="FAILED", completed_ns=time.time_ns())
+            logger.exception("Global CXL prefetch task failed")
+        finally:
+            self._release(keys, reserved, request_id, future)
+
+    def _release(
+        self,
+        keys: list[CacheEngineKey],
+        reserved: int,
+        request_id: Optional[str] = None,
+        future: Any = None,
+    ) -> None:
+        with self._lock:
+            self._inflight_bytes = max(0, self._inflight_bytes - reserved)
+            self._inflight_keys.difference_update(keys)
+            if request_id and future is not None:
+                futures = self._request_futures.get(request_id)
+                if futures is not None:
+                    futures.discard(future)
+                    if not futures:
+                        self._request_futures.pop(request_id, None)
+
+    def cancel(self, request_id: str, route_epoch: int) -> int:
+        with self._lock:
+            previous = self._route_epochs.get(request_id, -1)
+            if route_epoch < previous:
+                return 0
+            self._route_epochs[request_id] = route_epoch
+            futures = list(self._request_futures.get(request_id, ()))
+        return sum(1 for future in futures if future.cancel())
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def status(self, task_id: str) -> Optional[dict[str, int | str | None]]:
+        with self._lock:
+            status = self._task_status.get(task_id)
+            return dict(status) if status is not None else None
+
 
 
 class LMCacheEngine:
@@ -198,6 +518,15 @@ class LMCacheEngine:
         else:
             logger.info("KV events are disabled.")
 
+        # Dynamo owns global prediction and placement.  LMCache only keeps a
+        # bounded, rank-local CXL->CPU data-plane executor.
+        self._cxl_prefetch_executor = _CxlPrefetchExecutor.maybe_create(
+            self, config
+        )
+        # Route-time hints are monotonic per request.  This prevents a stale
+        # node reservation from starting new work after a reroute.
+        self._prefetch_route_epochs: dict[str, int] = {}
+
         # HACK: remove this in the future
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
@@ -223,6 +552,23 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        # CPU-to-CXL offload is prepared rank-locally and published only after
+        # the controller has observed a successful prepare on every TP rank.
+        # Keep the newly written keys separate from lookup pin state: the CPU
+        # source remains resident and the CXL objects are intentionally not
+        # routable until the explicit commit message arrives.  Only newly
+        # written keys are retained here so an abort cannot remove an object
+        # that predated this operation and was reported as ALREADY_PRESENT.
+        self._pending_offloads: dict[
+            str, tuple[str, tuple[CacheEngineKey, ...]]
+        ] = {}
+        # After a rank publishes its events, keep the prepared keys until the
+        # coordinator confirms that every TP rank committed.  If another rank
+        # fails, the coordinator can still roll back already-published shards.
+        self._committed_offloads: dict[
+            str, tuple[str, tuple[CacheEngineKey, ...]]
+        ] = {}
+        self._pending_offloads_lock = threading.Lock()
 
         InitializeUsageContext(config.to_original_config(), metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -788,6 +1134,155 @@ class LMCacheEngine:
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
         yield
 
+    def submit_cxl_prefetch(
+        self,
+        request_id: str,
+        tokens: Iterable[int] | torch.Tensor,
+        max_chunks: int,
+        candidate_block_indices: Optional[Iterable[int]] = None,
+    ) -> dict[str, int | bool | str | None]:
+        """Translate logical tokens and submit a bounded reactive hint.
+
+        Dynamo never constructs LMCache keys.  The local TokenDatabase keeps
+        chunk size, hash configuration, model namespace, dtype, and TP-rank
+        semantics on the LMCache side where they belong.
+        """
+        if self.storage_manager is None or max_chunks <= 0:
+            return {
+                "enabled": False,
+                "scheduled": 0,
+                "deduplicated": 0,
+                "already_cpu": 0,
+                "capacity_rejected": 0,
+                "status": "unavailable",
+            }
+
+        keys = _select_cxl_prefetch_keys(
+            self.token_database,
+            tokens,
+            max_chunks,
+            candidate_block_indices,
+        )
+
+        return self.storage_manager.submit_cxl_prefetch(
+            keys,
+            max_chunks=max_chunks,
+            request_id=request_id,
+        )
+
+    def get_cxl_prefetch_stats(self) -> dict[str, int]:
+        """Return bounded reactive CXL prefetch admission/completion counters."""
+        if self.storage_manager is None:
+            return {}
+        return self.storage_manager.get_cxl_prefetch_stats()
+
+    def prefetch_segments(
+        self,
+        keys: Iterable[CacheEngineKey],
+        *,
+        trigger_key: Optional[CacheEngineKey] = None,
+        request_id: Optional[str] = None,
+        deadline_ns: Optional[int] = None,
+        priority: int = 0,
+        context: Optional[PrefetchContext] = None,
+        max_prefetch_bytes: Optional[int] = None,
+        route_epoch: int = 0,
+        task_id: Optional[str] = None,
+    ) -> int:
+        """Best-effort prefetch of an arbitrary set of cache segments.
+
+        Keys are intentionally independent (they need not form a prefix), so
+        a Dynamo/router hint can be forwarded without going through the legacy
+        prefix-only ``async_lookup_and_prefetch`` path.  The operation is
+        default-off with the global prefetch configuration and returns
+        the number of entries accepted by its bounded background queue.
+        """
+        executor = self._cxl_prefetch_executor
+        if executor is None:
+            return 0
+        return executor.prefetch_keys(
+            keys,
+            request_id=request_id,
+            deadline_ns=deadline_ns,
+            priority=priority,
+            max_prefetch_bytes=max_prefetch_bytes,
+            route_epoch=route_epoch,
+            task_id=task_id,
+        )
+
+    def prefetch_tokens(
+        self,
+        tokens: Iterable[int] | torch.Tensor,
+        *,
+        request_id: Optional[str] = None,
+        route_epoch: int = 0,
+        deadline_ns: Optional[int] = None,
+        priority: int = 0,
+        max_prefetch_bytes: Optional[int] = None,
+        request_configs: Optional[dict] = None,
+        task_id: Optional[str] = None,
+        start_chunk: Optional[int] = None,
+        end_chunk: Optional[int] = None,
+        ttl_ms: int = 5000,
+    ) -> int:
+        """Route-time hint entry point using logical prompt tokens.
+
+        Token-to-key conversion remains local to the worker, preserving TP
+        rank, model namespace, dtype, tags, and the configured hash function.
+        Older epochs are rejected before any CXL work is submitted.
+        """
+        if request_id:
+            previous = self._prefetch_route_epochs.get(request_id, -1)
+            if route_epoch < previous:
+                return 0
+            self._prefetch_route_epochs[request_id] = route_epoch
+        infos = list(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                mask=None,
+                request_configs=request_configs,
+            )
+        )
+        begin = max(0, int(start_chunk or 0))
+        finish = int(end_chunk) if end_chunk is not None else len(infos)
+        finish = max(begin, min(finish, len(infos)))
+        keys = [key for _, _, key in infos[begin:finish]]
+        return self.prefetch_segments(
+            keys,
+            request_id=request_id,
+            deadline_ns=deadline_ns,
+            priority=priority,
+            route_epoch=route_epoch,
+            max_prefetch_bytes=max_prefetch_bytes,
+            task_id=task_id,
+            context=PrefetchContext(
+                model_namespace=str(self.metadata.model_name),
+                tp_rank=int(self.metadata.worker_id),
+            ),
+        )
+
+    def prefetch_status(self, task_id: str) -> Optional[dict]:
+        """Return a bounded snapshot for a router-issued prefetch task."""
+        executor = self._cxl_prefetch_executor
+        if executor is None:
+            return None
+        return executor.status(task_id)
+
+    def cancel_prefetch_hint(self, request_id: str, route_epoch: int) -> int:
+        """Cancel queued work for an obsolete route epoch."""
+        previous = self._prefetch_route_epochs.get(request_id, -1)
+        if route_epoch < previous:
+            return 0
+        self._prefetch_route_epochs[request_id] = route_epoch
+        executor = self._cxl_prefetch_executor
+        if executor is None:
+            return 0
+        return executor.cancel(request_id, route_epoch)
+
+    def drain_prefetch_access_events(self):
+        """The predictor moved to Dynamo; no worker-local events are emitted."""
+        return []
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def retrieve(
@@ -897,6 +1392,7 @@ class LMCacheEngine:
             onload_time * 1000,
             tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
         )
+
         return ret_mask
 
     @_lmcache_nvtx_annotate
@@ -1188,58 +1684,852 @@ class LMCacheEngine:
         """
         assert self.storage_manager is not None
 
+        memory_objs: list[Optional[MemoryObj]] = []
         num_tokens = self.lookup(
             tokens,
             search_range=[old_position],
             lookup_id=event_id,
             pin=True,
         )
+        try:
+            keys = self.lookup_pins.get(event_id, {}).get(old_position, [])
+            if not num_tokens or not keys:
+                logger.debug("Move is not performed as there are no tokens to move.")
+                return 0
 
-        if not num_tokens:
-            logger.debug("Move is not performed as there are no tokens to move.")
-            return 0
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=old_position,
+            )
+            assert memory_objs is not None, "Failed to get memory objects to move"
+            if any(memory_obj is None for memory_obj in memory_objs):
+                raise RuntimeError("Failed to get a complete pinned prefix to move")
+            logger.debug(
+                f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+            )
 
-        block_mapping = self.lookup_pins[event_id]
-        assert len(block_mapping) == 1
-        keys = block_mapping[old_position]
+            typed_memory_objs = [memory_obj for memory_obj in memory_objs if memory_obj]
+            # TODO: reduce loops
+            token_dim = typed_memory_objs[0].meta.fmt.token_dim()
+            offsets = [memory_obj.meta.shape[token_dim] for memory_obj in typed_memory_objs]
 
-        memory_objs = self.storage_manager.batched_get(
-            keys=keys,
-            location=old_position,
+            transfer_spec = {
+                "target_peer_init_url": new_position[0],
+                "offsets": offsets,
+            }
+
+            p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
+            future = asyncio.run_coroutine_threadsafe(
+                p2p_backend.async_batched_submit_put_task(
+                    keys,
+                    typed_memory_objs,
+                    transfer_spec=transfer_spec,
+                ),
+                self.storage_manager.loop,
+            )
+            future.result()
+
+            if not do_copy:
+                self.storage_manager.batched_remove(keys, locations=[old_position])
+
+            logger.debug(
+                f"Moving {len(keys)} chunks from {old_position} to {new_position}"
+            )
+            return num_tokens
+        finally:
+            for memory_obj in memory_objs:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+            self.lookup_unpin(event_id)
+
+    def move_intra_node(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        old_position: str,
+        new_position: tuple[str, str],
+        event_id: str,
+        do_copy: bool = True,
+        max_chunks: Optional[int] = None,
+    ) -> int:
+        """
+        Intra-node (same worker) promotion of a KV prefix into LocalCPUBackend.
+
+        This implements the "prefetch" branch of a controller-driven move whose
+        destination is the *same* worker (see cache_controller/worker.py). It
+        pulls a contiguous prefix from a slower local tier (e.g. ``CxlBackend``
+        or ``LocalDiskBackend``) up into ``LocalCPUBackend`` so a subsequent
+        lookup hits the faster CPU tier instead of the source tier.
+
+        Unlike :meth:`move`, this does NOT go through ``P2PBackend`` / the
+        network: the copy is a local (e.g. CXL->CPU) write-back.
+
+        :param tokens: The token ids of the prefix to promote.
+        :param old_position: Source backend name, e.g. ``"CxlBackend"``.
+        :param new_position: ``(worker_url, backend_name)``; ``backend_name``
+            must be ``"LocalCPUBackend"`` for now.
+        :param event_id: Unique id used to pin/unpin the source keys.
+        :param do_copy: If True (default) keep the source copy; if False, remove
+            the promoted keys from the source tier after the copy.
+        :param max_chunks: Optional budget cap; promote at most this many leading
+            chunks. Used by the predictive prefetcher to bound CPU-tier pressure.
+
+        :return: Number of chunks newly promoted into LocalCPUBackend. (Reported
+            back to the controller via ``MoveWorkerRetMsg.num_tokens`` as a unit
+            count.)
+        """
+        assert self.storage_manager is not None
+        assert new_position[1] == "LocalCPUBackend", (
+            "move_intra_node currently only supports promoting to LocalCPUBackend."
         )
-        assert memory_objs is not None, "Failed to get memory objects to move"
-        logger.debug(
-            f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+
+        # 1) Lookup + pin the contiguous prefix in the source tier so it cannot
+        #    be evicted between the lookup and the copy.
+        num_tokens = self.lookup(
+            tokens,
+            search_range=[old_position],
+            lookup_id=event_id,
+            pin=True,
+        )
+        try:
+            if not num_tokens:
+                logger.debug(
+                    "move_intra_node: nothing to prefetch from %s.", old_position
+                )
+                return 0
+
+            keys = self.lookup_pins.get(event_id, {}).get(old_position, [])
+            if not keys:
+                return 0
+
+            # Budget cap: only promote the leading `max_chunks` chunks. The rest
+            # stay pinned until the `finally` below unpins the whole event.
+            if max_chunks is not None and max_chunks >= 0:
+                keys = keys[:max_chunks]
+                if not keys:
+                    return 0
+
+            # 2) Pull the prefix from the source tier. For CxlBackend this copies
+            #    CXL -> a standalone pinned CPU staging buffer (see
+            #    CxlBackend.load_bytes_from_cxl). We own the returned MemoryObjs
+            #    and MUST ref_count_down() each of them.
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=old_position,
+            )
+            if not memory_objs:
+                return 0
+
+            local_cpu_backend = self.storage_manager.storage_backends[
+                "LocalCPUBackend"
+            ]
+
+            promoted = 0  # chunks newly copied into the CPU tier
+            contiguous = 0  # leading chunks confirmed present in the CPU tier
+            stop = False  # once a gap/failure is seen, keep the region a prefix
+            for key, mem_obj in zip(keys, memory_objs, strict=False):
+                if mem_obj is None:
+                    # Should not happen (keys were just pinned) but guard anyway.
+                    stop = True
+                    continue
+                try:
+                    if stop or mem_obj.tensor is None:
+                        stop = True
+                        continue
+                    if local_cpu_backend.contains(key):
+                        # Already in the CPU tier; still part of the prefix.
+                        contiguous += 1
+                        continue
+                    # IMPORTANT: the source staging buffer is NOT owned by
+                    # LocalCPUBackend's allocator (CxlBackend returns a standalone
+                    # pinned tensor). We must copy into a LocalCPUBackend-allocated
+                    # object before caching it, otherwise ownership/free is wrong.
+                    cached_obj = local_cpu_backend.allocate(
+                        mem_obj.get_shape(),
+                        mem_obj.get_dtype(),
+                        fmt=mem_obj.meta.fmt,
+                        # A controller move used for speculation must not evict
+                        # demand-resident CPU entries.
+                        eviction=False,
+                        busy_loop=False,
+                    )
+                    if cached_obj is None or cached_obj.tensor is None:
+                        # CPU tier full and eviction could not free space.
+                        stop = True
+                        continue
+                    cached_obj.tensor.copy_(mem_obj.tensor, non_blocking=False)
+                    # submit_put_task takes its own ref (ref_count_up); release our
+                    # local ref afterwards so hot_cache holds the only owning ref.
+                    if hasattr(local_cpu_backend, "submit_prefetch_put_task"):
+                        local_cpu_backend.submit_prefetch_put_task(key, cached_obj)
+                    else:
+                        local_cpu_backend.submit_put_task(key, cached_obj)
+                    cached_obj.ref_count_down()
+                    promoted += 1
+                    contiguous += 1
+                finally:
+                    # Release the staging buffer we received from batched_get.
+                    mem_obj.ref_count_down()
+
+            # 3) Move (not copy) semantics: drop the promoted prefix from source.
+            if not do_copy and contiguous:
+                self.storage_manager.batched_remove(
+                    keys[:contiguous], locations=[old_position]
+                )
+
+            logger.debug(
+                "move_intra_node: promoted %d/%d chunks from %s to LocalCPUBackend.",
+                promoted,
+                len(keys),
+                old_position,
+            )
+            return promoted
+        finally:
+            # Always release the source-tier pins, even on error.
+            # NOTE: the cross-node move() path currently omits this and can leak
+            # pins; move_intra_node deliberately does not repeat that bug.
+            self.lookup_unpin(event_id)
+
+    def promote_keys_intra_node(
+        self,
+        keys: List[CacheEngineKey],
+        source: str,
+        target: str,
+        event_id: str,
+        *,
+        do_copy: bool = True,
+        max_chunks: Optional[int] = None,
+        allow_eviction: bool = True,
+    ) -> PromotionResult:
+        """Promote arbitrary cache keys between local storage tiers.
+
+        CXL reads return standalone pinned staging objects. Each successful
+        promotion therefore allocates a fresh target-owned object and copies
+        into it. Source pins and all staging refs are balanced on every path.
+        """
+        assert self.storage_manager is not None
+        if target != "LocalCPUBackend":
+            raise ValueError("only LocalCPUBackend is a supported promotion target")
+        backends = self.storage_manager.storage_backends
+        if source not in backends or target not in backends:
+            raise ValueError(f"promotion backend unavailable: {source} -> {target}")
+
+        selected = list(dict.fromkeys(keys))
+        if max_chunks is not None and max_chunks >= 0:
+            selected = selected[:max_chunks]
+        requested = len(selected)
+        if not selected:
+            return PromotionResult(0, (), (), (), (), 0)
+
+        source_backend = backends[source]
+        target_backend = backends[target]
+        already_present: list[CacheEngineKey] = []
+        source_missing: list[CacheEngineKey] = []
+        failed: list[CacheEngineKey] = []
+        promoted: list[CacheEngineKey] = []
+        pinned: list[CacheEngineKey] = []
+        bytes_promoted = 0
+
+        try:
+            # Filter before reading so association speculation does not consume
+            # CXL bandwidth for objects that are already CPU-resident.
+            for key in selected:
+                if target_backend.contains(key):
+                    already_present.append(key)
+                    continue
+                # Pin explicitly instead of contains(..., pin=True): backend
+                # demand lookup bookkeeping (keys_in_request) must not retain
+                # speculative association keys.
+                if source_backend.contains(key) and source_backend.pin(key):
+                    pinned.append(key)
+                else:
+                    source_missing.append(key)
+
+            if not pinned:
+                return PromotionResult(
+                    requested,
+                    (),
+                    tuple(already_present),
+                    tuple(source_missing),
+                    (),
+                    0,
+                )
+
+            memory_objs = self.storage_manager.batched_get(
+                keys=pinned,
+                location=source,
+            )
+            if memory_objs is None:
+                failed.extend(pinned)
+                memory_objs = []
+
+            handled = 0
+            for key, mem_obj in zip(pinned, memory_objs, strict=False):
+                handled += 1
+                if mem_obj is None:
+                    failed.append(key)
+                    continue
+                try:
+                    if mem_obj.tensor is None:
+                        failed.append(key)
+                        continue
+                    if target_backend.contains(key):
+                        already_present.append(key)
+                        continue
+                    cached_obj = target_backend.allocate(
+                        mem_obj.get_shape(),
+                        mem_obj.get_dtype(),
+                        fmt=mem_obj.meta.fmt,
+                        eviction=allow_eviction,
+                        busy_loop=False,
+                    )
+                    if cached_obj is None or cached_obj.tensor is None:
+                        failed.append(key)
+                        continue
+                    try:
+                        cached_obj.tensor.copy_(
+                            mem_obj.tensor, non_blocking=False
+                        )
+                        if not allow_eviction and hasattr(
+                            target_backend, "submit_prefetch_put_task"
+                        ):
+                            target_backend.submit_prefetch_put_task(key, cached_obj)
+                        else:
+                            target_backend.submit_put_task(key, cached_obj)
+                    finally:
+                        cached_obj.ref_count_down()
+                    promoted.append(key)
+                    bytes_promoted += mem_obj.get_size()
+                except Exception:
+                    failed.append(key)
+                    logger.exception(
+                        "Promotion failed for key=%s event_id=%s",
+                        getattr(key, "chunk_hash", key),
+                        event_id,
+                    )
+                finally:
+                    mem_obj.ref_count_down()
+            if handled < len(pinned):
+                failed.extend(pinned[handled:])
+
+            if not do_copy and promoted:
+                self.storage_manager.batched_remove(promoted, locations=[source])
+            return PromotionResult(
+                requested,
+                tuple(promoted),
+                tuple(already_present),
+                tuple(source_missing),
+                tuple(failed),
+                bytes_promoted,
+            )
+        finally:
+            for key in pinned:
+                source_backend.unpin(key)
+
+    def offload_to_backend(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        source_backend: str = "LocalCPUBackend",
+        target_backend: str = "CxlBackend",
+        copy: bool = True,
+        max_chunks: int = 8,
+        operation_id: str = "offload",
+        publish_events: bool = True,
+        max_bytes: int = 0,
+    ) -> BackendOffloadResult:
+        """Copy a bounded LocalCPU prefix into CXL and release source pins.
+
+        With ``publish_events=False`` this is the prepare half of a
+        controller-coordinated TP offload.  Successful keys are retained in a
+        bounded operation table and become visible to Dynamo only when
+        :meth:`publish_pending_offload` is called.  ``copy=False`` is rejected
+        until a coordinated TP-wide CPU-removal barrier exists; automatic
+        offload is copy-only.
+        """
+        assert self.storage_manager is not None
+        if len(tokens) == 0:
+            return BackendOffloadResult(False, 0, 0, 0, 0, "empty token prefix")
+        if max_chunks <= 0:
+            return BackendOffloadResult(False, 0, 0, 0, 0, "max_chunks must be positive")
+        if not copy:
+            return BackendOffloadResult(
+                False,
+                0,
+                0,
+                0,
+                0,
+                "CPU move is disabled until a TP-wide removal barrier is implemented",
+            )
+        if source_backend != "LocalCPUBackend" or target_backend != "CxlBackend":
+            return BackendOffloadResult(
+                False,
+                0,
+                0,
+                0,
+                0,
+                "automatic offload currently supports only LocalCPUBackend -> CxlBackend",
+            )
+        backends = self.storage_manager.storage_backends
+        if source_backend not in backends or target_backend not in backends:
+            return BackendOffloadResult(
+                False,
+                0,
+                0,
+                0,
+                0,
+                f"backend unavailable: {source_backend} -> {target_backend}",
+            )
+
+        lookup_id = operation_id
+        pinned_keys: list[CacheEngineKey] = []
+        memory_objs: list[Optional[MemoryObj]] = []
+        committed = 0
+        already_present = 0
+        failed = 0
+        bytes_written = 0
+        error: Optional[str] = None
+        completed_keys: list[CacheEngineKey] = []
+        prepared_keys: list[CacheEngineKey] = []
+
+        try:
+            matched_tokens = self.lookup(
+                tokens,
+                search_range=[source_backend],
+                lookup_id=lookup_id,
+                pin=True,
+            )
+            pinned_keys = list(
+                self.lookup_pins.get(lookup_id, {}).get(source_backend, [])
+            )[:max_chunks]
+            if matched_tokens <= 0 or not pinned_keys:
+                return BackendOffloadResult(
+                    False, 0, 0, 0, 0, "source prefix not found"
+                )
+
+            memory_objs = self.storage_manager.batched_get(
+                keys=pinned_keys, location=source_backend
+            ) or []
+            target = backends[target_backend]
+            selected_keys = list(pinned_keys)
+            if max_bytes > 0:
+                selected_keys = []
+                selected_bytes = 0
+                for index, key in enumerate(pinned_keys):
+                    memory_obj = memory_objs[index] if index < len(memory_objs) else None
+                    if memory_obj is None or memory_obj.tensor is None:
+                        selected_keys.append(key)
+                        continue
+                    try:
+                        object_bytes = int(memory_obj.get_physical_size())
+                    except Exception:
+                        object_bytes = int(memory_obj.get_size())
+                    if selected_keys and selected_bytes + object_bytes > max_bytes:
+                        break
+                    if not selected_keys and object_bytes > max_bytes:
+                        break
+                    selected_keys.append(key)
+                    selected_bytes += object_bytes
+                if not selected_keys:
+                    for memory_obj in memory_objs:
+                        if memory_obj is not None:
+                            memory_obj.ref_count_down()
+                    return BackendOffloadResult(
+                        False,
+                        0,
+                        0,
+                        0,
+                        0,
+                        f"max_bytes={max_bytes} is smaller than one CXL chunk",
+                    )
+            selected_key_set = set(selected_keys)
+            background_slot = getattr(target, "background_offload_slot", None)
+            for index, key in enumerate(pinned_keys):
+                memory_obj = memory_objs[index] if index < len(memory_objs) else None
+                if key not in selected_key_set:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                    continue
+                if memory_obj is None or memory_obj.tensor is None:
+                    failed += 1
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                    continue
+                try:
+                    # Offload owns at most one CXL chunk at a time.  The
+                    # governor never waits for serving work; losing this
+                    # admission race defers the remainder to the next
+                    # planner round and releases every outstanding CPU ref.
+                    slot = (
+                        background_slot()
+                        if background_slot is not None
+                        else nullcontext(True)
+                    )
+                    with slot as admitted:
+                        if not admitted:
+                            remaining = sum(
+                                1
+                                for remaining_key in pinned_keys[index:]
+                                if remaining_key in selected_key_set
+                            )
+                            failed += remaining
+                            error = (
+                                "CXL offload deferred: serving-priority resource "
+                                "is busy"
+                            )
+                            logger.debug(
+                                "Deferring CPU-to-CXL offload operation=%s at "
+                                "chunk=%s; remaining_chunks=%d",
+                                operation_id,
+                                getattr(key, "chunk_hash", key),
+                                remaining,
+                            )
+                            for remaining_index in range(index + 1, len(pinned_keys)):
+                                remaining_obj = (
+                                    memory_objs[remaining_index]
+                                    if remaining_index < len(memory_objs)
+                                    else None
+                                )
+                                if remaining_obj is not None:
+                                    remaining_obj.ref_count_down()
+                            break
+                        result = target.submit_put_task(
+                            key, memory_obj, publish_events=publish_events
+                        )
+                    status = getattr(getattr(result, "status", None), "value", result)
+                    if status in ("success", "stored"):
+                        committed += 1
+                        bytes_written += int(
+                            getattr(result, "bytes_written", memory_obj.get_size()) or 0
+                        )
+                        completed_keys.append(key)
+                        prepared_keys.append(key)
+                    elif status in ("already_present",):
+                        already_present += 1
+                        completed_keys.append(key)
+                        if not publish_events and getattr(
+                            result, "needs_publish", False
+                        ):
+                            prepared_keys.append(key)
+                    elif status in ("deferred",):
+                        failed += 1
+                        error = (
+                            getattr(result, "detail", None)
+                            or "CXL offload deferred: serving-priority resource is busy"
+                        )
+                    else:
+                        failed += 1
+                        error = getattr(result, "detail", None) or str(status)
+                except Exception as exc:
+                    failed += 1
+                    error = str(exc)
+                    logger.exception(
+                        "CPU-to-CXL offload failed for key=%s operation=%s",
+                        getattr(key, "chunk_hash", key),
+                        operation_id,
+                    )
+                finally:
+                    memory_obj.ref_count_down()
+
+            success = failed == 0 and len(completed_keys) == len(selected_keys)
+            if not publish_events and (success or prepared_keys):
+                self._remember_pending_offload(
+                    operation_id,
+                    target_backend,
+                    prepared_keys,
+                )
+                logger.info(
+                    "CXL offload prepared: operation=%s chunks=%d bytes=%d; "
+                    "waiting for CXL_READY commit",
+                    operation_id,
+                    len(completed_keys),
+                    bytes_written,
+                )
+            return BackendOffloadResult(
+                success,
+                committed,
+                already_present,
+                failed,
+                bytes_written,
+                error,
+            )
+        except Exception as exc:
+            error = str(exc)
+            logger.exception("CPU-to-backend offload failed: operation=%s", operation_id)
+            # An exception outside the per-key block can still occur after a
+            # previous key has created a CXL object.  Preserve those keys in
+            # the operation table so a controller-level abort can destroy
+            # them instead of leaving invisible objects behind.
+            if not publish_events and prepared_keys:
+                self._remember_pending_offload(
+                    operation_id,
+                    target_backend,
+                    prepared_keys,
+                )
+            return BackendOffloadResult(
+                False,
+                committed,
+                already_present,
+                failed + 1,
+                bytes_written,
+                error,
+            )
+        finally:
+            # lookup_unpin releases every key pinned by lookup, including keys
+            # beyond max_chunks that were intentionally not copied.
+            self.lookup_unpin(lookup_id)
+
+    def _remember_pending_offload(
+        self,
+        operation_id: str,
+        target_backend: str,
+        prepared_keys: Sequence[CacheEngineKey],
+    ) -> None:
+        """Record the new CXL keys that an explicit commit must publish."""
+        new_keys = tuple(dict.fromkeys(prepared_keys))
+        evicted: Optional[tuple[str, tuple[CacheEngineKey, ...]]] = None
+        cleanup_replacement: Optional[
+            tuple[str, tuple[CacheEngineKey, ...]]
+        ] = None
+        with self._pending_offloads_lock:
+            if (
+                operation_id not in self._pending_offloads
+                and len(self._pending_offloads) >= 128
+            ):
+                evicted_operation = next(iter(self._pending_offloads))
+                evicted = self._pending_offloads.pop(evicted_operation, None)
+                if evicted is not None:
+                    logger.warning(
+                        "Aborting stale prepared offload operation=%s "
+                        "to keep the pending table bounded",
+                        evicted_operation,
+                    )
+            previous = self._pending_offloads.get(operation_id)
+            if previous is None:
+                pending = (target_backend, new_keys)
+            elif previous[0] == target_backend:
+                # Reusing an operation ID must not discard keys from the first
+                # attempt.  A retry may observe those keys as ALREADY_PRESENT;
+                # retaining the union keeps a later abort able to remove them.
+                pending = (
+                    target_backend,
+                    tuple(dict.fromkeys((*previous[1], *new_keys))),
+                )
+            else:
+                # This indicates a caller bug, but silently replacing the old
+                # record would leak its objects.  Keep the old transaction and
+                # clean the newly supplied keys immediately.
+                logger.error(
+                    "Cannot reuse offload operation=%s across backends %s -> %s",
+                    operation_id,
+                    previous[0],
+                    target_backend,
+                )
+                pending = previous
+                cleanup_replacement = (target_backend, new_keys)
+            self._pending_offloads[operation_id] = pending
+
+        if evicted is not None:
+            self._cleanup_pending_offload(evicted)
+        if cleanup_replacement is not None:
+            self._cleanup_pending_offload(cleanup_replacement)
+
+    def _cleanup_pending_offload(
+        self,
+        pending: tuple[str, tuple[CacheEngineKey, ...]],
+    ) -> BackendOffloadResult:
+        """Destroy the physical objects belonging to one prepared operation."""
+        target_backend, keys = pending
+        if not keys:
+            return BackendOffloadResult(True, 0, 0, 0, 0, None)
+        if self.storage_manager is None:
+            return BackendOffloadResult(
+                False, 0, 0, len(keys), 0, "storage manager unavailable"
+            )
+        target = self.storage_manager.storage_backends.get(target_backend)
+        if target is None:
+            return BackendOffloadResult(
+                False,
+                0,
+                0,
+                len(keys),
+                0,
+                f"backend unavailable: {target_backend}",
+            )
+
+        removed = 0
+        errors: list[str] = []
+        native_exists = getattr(target, "native_exists", None)
+        for key in keys:
+            try:
+                removed_key = target.remove(key, force=True)
+                if not removed_key:
+                    # A backend may report False for an already-missing key.
+                    # Treat a confirmed miss as clean,
+                    # but retry once when a native object is still present;
+                    # this matters for a CXL destroy that lost a lock race.
+                    present = target.contains(key)
+                    if not present and callable(native_exists):
+                        present = bool(native_exists(key))
+                    if present:
+                        removed_key = target.remove(key, force=True)
+                        if not removed_key:
+                            present = target.contains(key)
+                            if not present and callable(native_exists):
+                                present = bool(native_exists(key))
+                    if not present:
+                        removed_key = True
+                if removed_key:
+                    removed += 1
+                else:
+                    errors.append(
+                        f"{getattr(key, 'chunk_hash', key)}: object remains present"
+                    )
+            except Exception as exc:
+                errors.append(f"{getattr(key, 'chunk_hash', key)}: {exc}")
+                logger.exception(
+                    "Failed to abort prepared offload key=%s",
+                    getattr(key, "chunk_hash", key),
+                )
+        failed = len(keys) - removed
+        return BackendOffloadResult(
+            failed == 0,
+            removed,
+            0,
+            failed,
+            0,
+            "; ".join(errors) if errors else None,
         )
 
-        # TODO: reduce loops
-        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
-        offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
+    def abort_pending_offload(self, operation_id: str) -> BackendOffloadResult:
+        """Abort a prepared or partially committed offload."""
+        with self._pending_offloads_lock:
+            pending = self._pending_offloads.pop(operation_id, None)
+            committed = getattr(self, "_committed_offloads", {}).pop(
+                operation_id, None
+            )
+            if pending is None:
+                pending = committed
+            elif committed is not None and pending[0] == committed[0]:
+                # Normally an operation is either pending or committed.  If a
+                # retried operation ID created both records, abort both sets
+                # instead of dropping the older, already-published keys.
+                pending = (
+                    pending[0],
+                    tuple(dict.fromkeys((*pending[1], *committed[1]))),
+                )
+        # Abort is idempotent: a prepare that produced no new keys, or a
+        # duplicate cleanup message, is already in the desired final state.
+        if pending is None:
+            return BackendOffloadResult(True, 0, 0, 0, 0, None)
+        result = self._cleanup_pending_offload(pending)
+        if not result.success:
+            # Keep failed cleanup retryable.  The controller may retry the
+            # abort, and engine shutdown will make one more best-effort pass.
+            with self._pending_offloads_lock:
+                if (
+                    operation_id not in self._pending_offloads
+                    and operation_id
+                    not in getattr(self, "_committed_offloads", {})
+                ):
+                    self._pending_offloads[operation_id] = pending
+        return result
 
-        transfer_spec = {
-            "target_peer_init_url": new_position[0],
-            "offsets": offsets,
-        }
+    def finalize_pending_offload(self, operation_id: str) -> BackendOffloadResult:
+        """Release rollback bookkeeping after every TP rank committed."""
+        with self._pending_offloads_lock:
+            committed = getattr(self, "_committed_offloads", {}).pop(
+                operation_id, None
+            )
+            pending = self._pending_offloads.get(operation_id)
+        if committed is not None:
+            return BackendOffloadResult(
+                True, len(committed[1]), 0, 0, 0, None
+            )
+        if pending is not None:
+            return BackendOffloadResult(
+                False, 0, 0, len(pending[1]), 0, "offload has not committed"
+            )
+        # Finalization is bookkeeping-only and idempotent.  This also makes a
+        # duplicate finalize safe after a worker restart or retry.
+        return BackendOffloadResult(True, 0, 0, 0, 0, None)
 
-        logger.info(self.storage_manager.storage_backends)
-        p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
+    def abort_all_pending_offloads(self) -> None:
+        """Best-effort cleanup for prepared objects during engine shutdown."""
+        with self._pending_offloads_lock:
+            operation_ids = list(self._pending_offloads)
+        for operation_id in operation_ids:
+            result = self.abort_pending_offload(operation_id)
+            if not result.success:
+                logger.error(
+                    "Failed to abort prepared offload during shutdown: operation=%s "
+                    "removed=%d failed=%d error=%s",
+                    operation_id,
+                    result.committed_chunks,
+                    result.failed_chunks,
+                    result.error,
+                )
 
-        future = asyncio.run_coroutine_threadsafe(
-            p2p_backend.async_batched_submit_put_task(
-                keys,
-                memory_objs,  # type: ignore
-                transfer_spec=transfer_spec,
-            ),
-            self.storage_manager.loop,
-        )
+    def publish_pending_offload(self, operation_id: str) -> BackendOffloadResult:
+        """Publish one successfully prepared offload as ``CXL_READY``.
 
-        future.result()
-
-        if not do_copy:
-            self.storage_manager.batched_remove(keys, locations=[old_position])
-
-        logger.debug(f"Moving {num_tokens} token from {old_position} to {new_position}")
-        return num_tokens
+        Keep the operation in the pending table until every key is published.
+        This makes a failed commit retryable and lets the controller explicitly
+        abort the still-unpublished physical objects.
+        """
+        with self._pending_offloads_lock:
+            pending = self._pending_offloads.get(operation_id)
+        if pending is None:
+            return BackendOffloadResult(
+                False, 0, 0, 0, 0, f"no prepared offload for operation {operation_id}"
+            )
+        target_backend, keys = pending
+        if self.storage_manager is None:
+            return BackendOffloadResult(False, 0, 0, 0, 0, "storage manager unavailable")
+        target = self.storage_manager.storage_backends.get(target_backend)
+        if target is None:
+            return BackendOffloadResult(
+                False, 0, 0, len(keys), 0, f"backend unavailable: {target_backend}"
+            )
+        try:
+            published = target.publish_keys(keys)
+            success = len(published) == len(keys)
+            if not success:
+                return BackendOffloadResult(
+                    False,
+                    len(published),
+                    0,
+                    len(keys) - len(published),
+                    0,
+                    "one or more prepared CXL keys disappeared before commit",
+                )
+            with self._pending_offloads_lock:
+                # Keep the keys rollback-capable until the coordinator has
+                # observed commit success on every TP rank.  This closes the
+                # window where one rank publishes and another rank fails.
+                if self._pending_offloads.get(operation_id) == pending:
+                    self._pending_offloads.pop(operation_id, None)
+                    committed_offloads = getattr(
+                        self, "_committed_offloads", None
+                    )
+                    if committed_offloads is None:
+                        committed_offloads = {}
+                        self._committed_offloads = committed_offloads
+                    if len(committed_offloads) >= 128:
+                        evicted_operation = next(iter(committed_offloads))
+                        committed_offloads.pop(evicted_operation, None)
+                        logger.warning(
+                            "Dropping stale committed-offload bookkeeping=%s",
+                            evicted_operation,
+                        )
+                    committed_offloads[operation_id] = pending
+            logger.info(
+                "CXL_READY published: operation=%s chunks=%d",
+                operation_id,
+                len(published),
+            )
+            return BackendOffloadResult(True, len(published), 0, 0, 0, None)
+        except Exception as exc:
+            logger.exception("CXL_READY publication failed: operation=%s", operation_id)
+            return BackendOffloadResult(False, 0, 0, len(keys), 0, str(exc))
 
     # TODO(Jiayi): Add layerwise support.
     @_lmcache_nvtx_annotate
@@ -1471,6 +2761,39 @@ class LMCacheEngine:
             return events
         return []
 
+    def _emit_prefetch_tier_event(
+        self,
+        keys: Iterable[CacheEngineKey],
+        *,
+        medium: str = "CPU",
+    ) -> None:
+        """Publish speculative tier transitions to the Dynamo bridge."""
+        if not self.kv_events_enabled:
+            return
+        keys = list(keys)
+        if not keys:
+            return
+        for key in keys:
+            meta = self._kv_store_meta_by_hash.get(int(key.chunk_hash))
+            parent, token_ids, block_size, lora_id = meta or (
+                None,
+                [],
+                self.config.chunk_size,
+                None,
+            )
+            self.kv_events.append(
+                CacheStoreEvent(
+                    block_hashes=[int(key.chunk_hash)],
+                    parent_block_hash=parent,
+                    token_ids=list(token_ids),
+                    block_size=int(block_size or self.config.chunk_size),
+                    lora_id=lora_id,
+                    medium=medium,
+                    origin="PREFETCH",
+                    worker_id=int(self.metadata.worker_id),
+                )
+            )
+
     def _register_backend_kv_event_sinks(self) -> None:
         assert self.storage_manager is not None
         for backend in self.storage_manager.storage_backends.values():
@@ -1600,6 +2923,17 @@ class LMCacheEngine:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
 
+        if self._cxl_prefetch_executor is not None:
+            try:
+                self._cxl_prefetch_executor.close()
+            except Exception:
+                logger.exception("Failed to close global prefetch executor.")
+
+        try:
+            self.abort_all_pending_offloads()
+        except Exception:
+            logger.exception("Failed to abort prepared CPU-to-CXL offloads on shutdown.")
+
         if self.lmcache_worker is not None:
             try:
                 logger.info("Closing lmcache_worker...")
@@ -1659,11 +2993,14 @@ class LMCacheEngine:
 
         # TODO(Jiayi): hashing inside `process_tokens` can be skipped.
         used_keys: set[CacheEngineKey] = set()
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-        ):
+        chunk_infos = list(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            )
+        )
+        for start, end, key in chunk_infos:
             assert isinstance(key, CacheEngineKey)
             memory_obj = memory_obj_map.get(key)
             if memory_obj is None:
@@ -1772,6 +3109,7 @@ class LMCacheEngine:
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
+                request_id=kwargs.get("req_id"),
             )
             assert memory_objs is not None, (
                 "Failed to get memory objects from storage backend"

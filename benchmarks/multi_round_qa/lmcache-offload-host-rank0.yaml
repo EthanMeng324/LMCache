@@ -1,0 +1,27 @@
+# Host real-trace predictive-offload test: replica 0.
+# The CXL image is private to this run; do not reuse it in a live deployment.
+chunk_size: 16
+local_cpu: true
+max_local_cpu_size: 0.25
+save_unfull_chunk: false
+enable_kv_events: true
+
+enable_controller: true
+lmcache_instance_id: cxl-offload-host-0
+controller_pull_url: "127.0.0.1:9111"
+controller_reply_url: "127.0.0.1:9112"
+lmcache_worker_ports: [9410]
+lmcache_worker_heartbeat_time: 10
+
+extra_config:
+  cxl_dax_device: /tmp/lmcache-cxl-realtrace-host-20260804-i.img
+  max_cxl_size: 0.5
+  cxl_num_procs: 2
+  cxl_rank: 0
+  cxl_reset_on_init: full
+  # Predictive offload owns CPU->CXL copies.  Do not write every CPU block
+  # through to CXL before the router planner issues an OffloadMsg.
+  storage_write_policy: write_back
+  write_back_targets: [CxlBackend]
+  cxl_global_prefetch_enabled: false
+  enable_cache_migration: false

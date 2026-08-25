@@ -82,6 +82,7 @@ def run_unit_tests() -> int:
         config = Mock(spec=LMCacheEngineConfig)
         config.cache_policy = "LRU"
         config.local_cpu = True
+        config.chunk_size = 256
         config.lmcache_instance_id = "test_instance"
         config.extra_config = {
             "cxl_num_procs": 1,

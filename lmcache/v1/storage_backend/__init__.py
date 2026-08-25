@@ -211,6 +211,7 @@ def CreateStorageBackends(
             local_cpu_backend,
             dst_device,
             lmcache_worker,
+            metadata=metadata,
         )
         backend_name = str(cxl_backend)
         storage_backends[backend_name] = cxl_backend

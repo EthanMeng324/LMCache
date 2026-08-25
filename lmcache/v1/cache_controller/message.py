@@ -255,6 +255,91 @@ class MoveWorkerMsg(ControlMsg):
         )
 
 
+class PrefetchWorkerMsg(ControlMsg):
+    """Route-time, best-effort CXL-to-CPU hint for one TP rank."""
+
+    worker_event_id: str
+    tokens: list[int]
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    model_id: Optional[str] = None
+    route_epoch: int = 0
+    deadline_ns: Optional[int] = None
+    max_prefetch_bytes: Optional[int] = None
+    priority: int = 0
+    task_id: Optional[str] = None
+    start_chunk: Optional[int] = None
+    end_chunk: Optional[int] = None
+    ttl_ms: int = 5000
+
+    def describe(self) -> str:
+        return f"Prefetch route hint request={self.request_id} epoch={self.route_epoch}"
+
+
+class PrefetchStatusWorkerMsg(ControlMsg):
+    """Query one worker for a router-issued prefetch task."""
+
+    worker_event_id: str
+    task_id: str
+
+
+class PrefetchStatusWorkerRetMsg(ControlMsg):
+    worker_event_id: str
+    task_id: str
+    state: str
+    requested_chunks: int = 0
+    ready_chunks: int = 0
+    bytes_copied: int = 0
+    started_ns: Optional[int] = None
+    completed_ns: Optional[int] = None
+
+
+class OffloadWorkerMsg(ControlMsg):
+    """Execute one rank-local CPU-to-CXL offload."""
+
+    worker_event_id: str
+    event_id: str
+    tokens: list[int]
+    source: str = "LocalCPUBackend"
+    target: str = "CxlBackend"
+    copy: bool = True
+    max_chunks: int = 8
+    max_bytes: int = 0
+
+    def describe(self) -> str:
+        return f"Offload {len(self.tokens)} tokens to {self.target}"
+
+
+class CommitOffloadWorkerMsg(ControlMsg):
+    """Publish a previously prepared rank-local offload."""
+
+    worker_event_id: str
+    event_id: str
+
+    def describe(self) -> str:
+        return f"Publish prepared offload {self.event_id}"
+
+
+class AbortOffloadWorkerMsg(ControlMsg):
+    """Discard a previously prepared rank-local offload."""
+
+    worker_event_id: str
+    event_id: str
+
+    def describe(self) -> str:
+        return f"Discard prepared offload {self.event_id}"
+
+
+class FinalizeOffloadWorkerMsg(ControlMsg):
+    """Release bookkeeping for a globally committed offload."""
+
+    worker_event_id: str
+    event_id: str
+
+    def describe(self) -> str:
+        return f"Finalize committed offload {self.event_id}"
+
+
 class HealthWorkerMsg(ControlMsg):
     """Health message for a single lmcache worker"""
 
@@ -323,6 +408,70 @@ class MoveWorkerRetMsg(ControlRetMsg):
 
     def describe(self) -> str:
         return f"Moving {self.num_tokens} tokens"
+
+
+class PrefetchWorkerRetMsg(ControlRetMsg):
+    accepted: int
+    scheduled: int
+    cancelled: int = 0
+    stale: bool = False
+
+    def describe(self) -> str:
+        return f"Accepted {self.accepted} prefetch segments"
+
+
+class OffloadWorkerRetMsg(ControlRetMsg):
+    """Rank-local result returned by a background offload request."""
+
+    event_id: str
+    worker_id: int
+    success: bool
+    committed_chunks: int
+    already_present_chunks: int
+    failed_chunks: int
+    bytes_written: int
+    error: Optional[str] = None
+
+    def describe(self) -> str:
+        return f"Offload rank {self.worker_id}: success={self.success}"
+
+
+class CommitOffloadWorkerRetMsg(ControlRetMsg):
+    """Result of publishing a prepared rank-local offload."""
+
+    event_id: str
+    worker_id: int
+    success: bool
+    published_chunks: int
+    error: Optional[str] = None
+
+    def describe(self) -> str:
+        return f"Publish offload rank {self.worker_id}: success={self.success}"
+
+
+class AbortOffloadWorkerRetMsg(ControlRetMsg):
+    """Result of discarding a prepared rank-local offload."""
+
+    event_id: str
+    worker_id: int
+    success: bool
+    removed_chunks: int
+    error: Optional[str] = None
+
+    def describe(self) -> str:
+        return f"Discard offload rank {self.worker_id}: success={self.success}"
+
+
+class FinalizeOffloadWorkerRetMsg(ControlRetMsg):
+    """Result of releasing committed-offload bookkeeping."""
+
+    event_id: str
+    worker_id: int
+    success: bool
+    error: Optional[str] = None
+
+    def describe(self) -> str:
+        return f"Finalize offload rank {self.worker_id}: success={self.success}"
 
 
 class HealthWorkerRetMsg(ControlRetMsg):
@@ -453,6 +602,62 @@ class MoveMsg(OrchMsg):
         )
 
 
+class PrefetchHintMsg(OrchMsg):
+    """Router-to-LMCache route-time prefetch hint."""
+
+    event_id: str
+    instance_id: str
+    tokens: list[int]
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    model_id: Optional[str] = None
+    route_epoch: int = 0
+    deadline_ns: Optional[int] = None
+    max_prefetch_bytes: Optional[int] = None
+    priority: int = 0
+    task_id: Optional[str] = None
+    start_chunk: Optional[int] = None
+    end_chunk: Optional[int] = None
+    ttl_ms: int = 5000
+
+    def describe(self) -> str:
+        return f"Prefetch hint for instance {self.instance_id} epoch={self.route_epoch}"
+
+
+class PrefetchStatusMsg(OrchMsg):
+    """Query the status of a global prefetch task on an LMCache instance."""
+
+    event_id: str
+    instance_id: str
+    task_id: str
+
+
+class CancelPrefetchHintMsg(OrchMsg):
+    event_id: str
+    instance_id: str
+    request_id: str
+    route_epoch: int
+
+    def describe(self) -> str:
+        return f"Cancel prefetch hint request={self.request_id} epoch={self.route_epoch}"
+
+
+class OffloadMsg(OrchMsg):
+    """Fan out one CPU-to-CXL offload to every TP worker."""
+
+    event_id: str
+    instance_id: str
+    tokens: list[int]
+    source: str = "LocalCPUBackend"
+    target: str = "CxlBackend"
+    copy: bool = True
+    max_chunks: int = 8
+    max_bytes: int = 0
+
+    def describe(self) -> str:
+        return f"Offload CPU prefix from instance {self.instance_id} to CXL"
+
+
 class HealthMsg(OrchMsg):
     """Health message"""
 
@@ -488,6 +693,17 @@ class OrchRetMsg(MsgBase):
 
     def describe(self) -> str:
         return ""
+
+
+class PrefetchStatusRetMsg(OrchRetMsg):
+    event_id: str
+    task_id: str
+    state: str
+    requested_chunks: int = 0
+    ready_chunks: int = 0
+    bytes_copied: int = 0
+    started_ns: Optional[int] = None
+    completed_ns: Optional[int] = None
 
 
 class QueryInstRetMsg(OrchRetMsg):
@@ -560,6 +776,34 @@ class MoveRetMsg(OrchRetMsg):
         return f"Moving {self.num_tokens} tokens"
 
 
+class PrefetchHintRetMsg(OrchRetMsg):
+    event_id: str
+    accepted: int
+    scheduled: int
+    stale: bool = False
+
+    def describe(self) -> str:
+        return f"Prefetch hint accepted={self.accepted} scheduled={self.scheduled}"
+
+
+class CancelPrefetchHintRetMsg(OrchRetMsg):
+    event_id: str
+    cancelled: int
+
+    def describe(self) -> str:
+        return f"Cancelled {self.cancelled} prefetch tasks"
+
+
+class OffloadRetMsg(OrchRetMsg):
+    event_id: str
+    instance_id: str
+    success: bool
+    rank_results: list[OffloadWorkerRetMsg]
+
+    def describe(self) -> str:
+        return f"Offload {self.instance_id}: success={self.success}"
+
+
 class HealthRetMsg(OrchRetMsg):
     """Health return message"""
 
@@ -615,6 +859,18 @@ Msg = Union[
     DecompressWorkerRetMsg,
     MoveWorkerMsg,
     MoveWorkerRetMsg,
+    PrefetchWorkerMsg,
+    PrefetchWorkerRetMsg,
+    PrefetchStatusWorkerMsg,
+    PrefetchStatusWorkerRetMsg,
+    OffloadWorkerMsg,
+    OffloadWorkerRetMsg,
+    CommitOffloadWorkerMsg,
+    CommitOffloadWorkerRetMsg,
+    AbortOffloadWorkerMsg,
+    AbortOffloadWorkerRetMsg,
+    FinalizeOffloadWorkerMsg,
+    FinalizeOffloadWorkerRetMsg,
     HealthWorkerMsg,
     HealthWorkerRetMsg,
     CheckFinishWorkerMsg,
@@ -631,6 +887,14 @@ Msg = Union[
     DecompressRetMsg,
     MoveMsg,
     MoveRetMsg,
+    PrefetchHintMsg,
+    PrefetchHintRetMsg,
+    PrefetchStatusMsg,
+    PrefetchStatusRetMsg,
+    CancelPrefetchHintMsg,
+    CancelPrefetchHintRetMsg,
+    OffloadMsg,
+    OffloadRetMsg,
     HealthMsg,
     HealthRetMsg,
     CheckFinishMsg,

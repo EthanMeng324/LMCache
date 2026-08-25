@@ -1,0 +1,26 @@
+# A/B real-trace validation on one GPU.  Rank 0 owns a fresh shared CXL image.
+chunk_size: 256
+local_cpu: true
+# Keep the CPU tier small enough that complete prefixes are forced to CXL.
+max_local_cpu_size: 0.03
+save_unfull_chunk: false
+enable_kv_events: true
+
+enable_controller: true
+lmcache_instance_id: global-pf-ab
+controller_pull_url: "127.0.0.1:9111"
+controller_reply_url: "127.0.0.1:9112"
+lmcache_worker_ports: [9420]
+
+extra_config:
+  cxl_dax_device: /mnt/hdd/dahua/desktop/distibution/.runtime/global-prefetch-ab.img
+  max_cxl_size: 1
+  cxl_num_procs: 1
+  cxl_rank: 0
+  # The image was initialized by the first A/B worker; keep it across
+  # controller/worker restarts so the second pass can reuse CXL objects.
+  cxl_reset_on_init: none
+  cxl_global_prefetch_enabled: true
+  cxl_global_prefetch_workers: 1
+  cxl_global_prefetch_max_chunks: 4
+  cxl_global_prefetch_max_inflight_bytes: 134217728

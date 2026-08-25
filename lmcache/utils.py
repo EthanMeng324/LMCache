@@ -418,12 +418,21 @@ class CacheStoreEvent:
     block_size: int
     lora_id: int | None
     medium: str | None
+    origin: str | None = None
+    worker_id: int | None = None
+    event_seq: int | None = None
+    route_epoch: int | None = None
+    eta_ns: int | None = None
 
 
 @dataclass
 class CacheRemoveEvent:
     block_hashes: list[int]
     medium: str | None
+    origin: str | None = None
+    worker_id: int | None = None
+    event_seq: int | None = None
+    route_epoch: int | None = None
 
 
 ##### NVTX annotation #####

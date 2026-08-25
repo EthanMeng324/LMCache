@@ -1,0 +1,23 @@
+# Two-worker local validation: rank 1 joins the shared CXL file without reset.
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 0.5
+save_unfull_chunk: false
+enable_kv_events: true
+
+enable_controller: true
+lmcache_instance_id: global-pf-node1
+controller_pull_url: "127.0.0.1:9101"
+controller_reply_url: "127.0.0.1:9102"
+lmcache_worker_ports: [9410]
+
+extra_config:
+  cxl_dax_device: /mnt/hdd/dahua/desktop/distibution/.runtime/global-prefetch-e2e.img
+  max_cxl_size: 0.5
+  cxl_num_procs: 2
+  cxl_rank: 1
+  cxl_reset_on_init: none
+  cxl_global_prefetch_enabled: true
+  cxl_global_prefetch_workers: 1
+  cxl_global_prefetch_max_chunks: 2
+  cxl_global_prefetch_max_inflight_bytes: 67108864

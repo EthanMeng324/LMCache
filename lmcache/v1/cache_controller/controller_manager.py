@@ -39,8 +39,12 @@ from lmcache.v1.cache_controller.message import (  # isort: skip
     KVEvictMsg,
     LookupMsg,
     MoveMsg,
+    PrefetchHintMsg,
+    PrefetchStatusMsg,
+    CancelPrefetchHintMsg,
     Msg,
     MsgBase,
+    OffloadMsg,
     OpType,
     OrchMsg,
     OrchRetMsg,
@@ -195,6 +199,14 @@ class LMCacheControllerManager:
             return await self.kv_controller.decompress(msg)
         elif isinstance(msg, MoveMsg):
             return await self.kv_controller.move(msg)
+        elif isinstance(msg, PrefetchHintMsg):
+            return await self.kv_controller.prefetch_hint(msg)
+        elif isinstance(msg, PrefetchStatusMsg):
+            return await self.kv_controller.prefetch_status(msg)
+        elif isinstance(msg, CancelPrefetchHintMsg):
+            return await self.kv_controller.cancel_prefetch_hint(msg)
+        elif isinstance(msg, OffloadMsg):
+            return await self.kv_controller.offload(msg)
         elif isinstance(msg, CheckFinishMsg):
             # FIXME(Jiayi): This `check_finish` thing
             # shouldn't be implemented in kv_controller.
@@ -298,11 +310,16 @@ class LMCacheControllerManager:
 
                 if isinstance(msg, WorkerReqMsg):
                     ret_msg = await self.handle_worker_req_message(msg)
-                    await socket.send(msgspec.msgpack.encode(ret_msg))
+                elif isinstance(msg, OrchMsg):
+                    # External orchestrators use the same REQ/REP endpoint
+                    # as worker requests.  This makes a synchronous Dynamo
+                    # background offload command possible without an HTTP
+                    # side channel.
+                    ret_msg = await self.handle_orchestration_message(msg)
                 else:
                     logger.error(f"Unknown message type: {type(msg)}")
-                    err_msg = ErrorMsg(error=f"Unknown message type: {type(msg)}")
-                    await socket.send(msgspec.msgpack.encode(err_msg))
+                    ret_msg = ErrorMsg(error=f"Unknown message type: {type(msg)}")
+                await socket.send(msgspec.msgpack.encode(ret_msg))
 
     async def health_check(self):
         while True:

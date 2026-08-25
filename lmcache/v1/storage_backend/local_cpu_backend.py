@@ -63,6 +63,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
+        # Prefetch entries are tracked separately so a later demand access can
+        # promote them from probationary to protected accounting. Pure
+        # prefetch allocation uses eviction=False in the engine, so it cannot
+        # evict an existing demand entry under pressure.
+        self.prefetch_keys: set[CacheEngineKey] = set()
+        self.prefetch_metadata: dict[CacheEngineKey, dict[str, int | float]] = {}
+        extra_config = config.extra_config if isinstance(config.extra_config, dict) else {}
+        self.prefetch_ttl_ns = int(
+            extra_config.get("prefetch_ttl_ms", 500) * 1_000_000
+        )
 
         self.use_hot = config.local_cpu
         # NOTE: we keep the memory allocator argument for temporary
@@ -121,6 +131,34 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 lambda: len(self.keys_in_request)
             )
 
+    def _get_evict_candidates_locked(self, num_candidates: int = 1):
+        """Prefer probationary prefetch entries before demand-resident data.
+
+        ``cpu_lock`` must be held by the caller.  Iterating ``hot_cache`` keeps
+        the cache policy's LRU order while the membership check gives
+        speculative entries an admission-protection priority.
+        """
+        now_ns = time.time_ns()
+        probationary = [
+            key
+            for key, memory_obj in self.hot_cache.items()
+            if key in self.prefetch_keys and memory_obj.can_evict
+        ]
+        if probationary:
+            probationary.sort(
+                key=lambda key: (
+                    0
+                    if self.prefetch_metadata.get(key, {}).get("expire_ns", 0)
+                    and int(self.prefetch_metadata[key]["expire_ns"]) <= now_ns
+                    else 1,
+                    float(self.prefetch_metadata.get(key, {}).get("score", 0.0)),
+                )
+            )
+            return probationary[:num_candidates]
+        return self.cache_policy.get_evict_candidates(
+            self.hot_cache, num_candidates=num_candidates
+        )
+
     def __str__(self):
         return self.__class__.__name__
 
@@ -176,6 +214,68 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 )
 
         return None
+
+    def submit_prefetch_put_task(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        *,
+        expire_ns: Optional[int] = None,
+        score: float = 0.0,
+        trigger_key: Optional[CacheEngineKey] = None,
+    ) -> Optional[Future]:
+        """Admit a prefetch object without evicting demand-resident entries."""
+
+        with self.cpu_lock:
+            if key in self.hot_cache:
+                return None
+            memory_obj.ref_count_up()
+            self.hot_cache[key] = memory_obj
+            self.prefetch_keys.add(key)
+            self.prefetch_metadata[key] = {
+                "inserted_ns": time.time_ns(),
+                "expire_ns": expire_ns or time.time_ns() + self.prefetch_ttl_ns,
+                "score": score,
+                "demand_access_count": 0,
+            }
+            if trigger_key is not None:
+                self.prefetch_metadata[key]["trigger_key_hash"] = int(
+                    trigger_key.chunk_hash
+                )
+            self.cache_policy.update_on_put(key)
+            if self.batched_msg_sender is not None:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.ADMIT,
+                    key=key.chunk_hash,
+                )
+        return None
+
+    def mark_demand_access(self, key: CacheEngineKey) -> bool:
+        """Mark a prefetched entry as demand-protected."""
+
+        with self.cpu_lock:
+            if key not in self.prefetch_keys:
+                return False
+            self.prefetch_keys.discard(key)
+            metadata = self.prefetch_metadata.get(key)
+            if metadata is not None:
+                metadata["demand_access_count"] = int(
+                    metadata.get("demand_access_count", 0)
+                ) + 1
+                self.prefetch_metadata.pop(key, None)
+            return True
+
+    def expire_prefetch_entries(self, now_ns: Optional[int] = None) -> int:
+        """Remove expired probationary entries and return the count removed."""
+        now = now_ns or time.time_ns()
+        with self.cpu_lock:
+            expired = [
+                key
+                for key in self.prefetch_keys
+                if self.prefetch_metadata.get(key, {}).get("expire_ns", 0)
+                and int(self.prefetch_metadata[key]["expire_ns"]) <= now
+            ]
+        return self.batched_remove(expired, force=False) if expired else 0
 
     def batched_submit_put_task(
         self,
@@ -267,6 +367,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if memory_obj is None:
                 return False
 
+            self.prefetch_keys.discard(key)
+            self.prefetch_metadata.pop(key, None)
+
             self.cache_policy.update_on_force_evict(key)
             evicted_items.append((key, memory_obj))
 
@@ -308,6 +411,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 memory_obj = self.hot_cache.pop(key, None)
                 if memory_obj is None:
                     continue
+
+                self.prefetch_keys.discard(key)
+                self.prefetch_metadata.pop(key, None)
 
                 self.cache_policy.update_on_force_evict(key)
                 evicted_items.append((key, memory_obj))
@@ -544,8 +650,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # holding cpu_lock would deadlock.
                 evict_keys: list[CacheEngineKey] = []
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
+                    evict_keys = self._get_evict_candidates_locked(
+                        num_candidates
                     )
 
                 if evict_keys:
@@ -649,8 +755,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 num_candidates = 1
                 evict_keys = None
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
+                    evict_keys = self._get_evict_candidates_locked(
+                        num_candidates
                     )
 
                     # HACK: We assume batch_size=num_layers here.
@@ -671,6 +777,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 old_mem_objs.append(self.hot_cache[key])
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
+                                self.prefetch_keys.discard(key)
+                                self.prefetch_metadata.pop(key, None)
 
                             self.memory_allocator.batched_free(old_mem_objs)
 

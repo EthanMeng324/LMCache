@@ -1,0 +1,22 @@
+# Real ShareGPT service-trace validation config.  The shared mapping is backed
+# by host DRAM (/dev/shm) and is intentionally small for a four-GPU run.
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 2
+enable_kv_events: true
+
+extra_config:
+  cxl_dax_device: /dev/shm/lmcache-cxl.img
+  max_cxl_size: 1
+  cxl_num_procs: 4
+  cxl_rank: 0
+  cxl_reset_on_init: full
+  cxl_global_prefetch_enabled: true
+  cxl_global_prefetch_workers: 1
+  cxl_global_prefetch_max_chunks: 2
+  cxl_global_prefetch_max_inflight_bytes: 134217728
+  prefetch_min_support: 1
+  prefetch_top_k: 2
+  prefetch_cpu_capacity_ratio: 0.10
+  prefetch_max_inflight_tasks: 1
+  prefetch_max_inflight_bytes: 134217728

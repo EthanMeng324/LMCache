@@ -78,6 +78,9 @@ int cxl_shm_finalize();
 // Create a shared memory object
 // `size` is allocated bytes; `actual_size` is logical payload bytes (<= size).
 int cxl_shm_create(const char *name, size_t size, size_t actual_size, cxl_shm_hnd_t *hnd);
+// Mark a fully copied object readable by CXL readers.  A value of zero means
+// the object is still in the private prepare phase.
+int cxl_shm_set_actual_size(cxl_shm_hnd_t *hnd, size_t actual_size);
 // Open an existing shared memory object
 int cxl_shm_open_obj(const char *name, cxl_shm_hnd_t *hnd);
 // Close a shared memory object handle

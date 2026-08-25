@@ -43,6 +43,12 @@ from lmcache.v1.cache_controller.message import (  # noqa: E501
     LookupRetMsg,
     MoveMsg,
     MoveRetMsg,
+    PrefetchHintMsg,
+    PrefetchHintRetMsg,
+    PrefetchStatusMsg,
+    PrefetchStatusRetMsg,
+    CancelPrefetchHintMsg,
+    CancelPrefetchHintRetMsg,
     PinMsg,
     PinRetMsg,
     QueryInstMsg,
@@ -314,6 +320,189 @@ def create_app(
                 num_tokens=ret_msg.num_tokens,
             )
         except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    class PrefetchHintRequest(BaseModel):
+        instance_id: str
+        tokens: List[int]
+        request_id: Optional[str] = None
+        session_id: Optional[str] = None
+        model_id: Optional[str] = None
+        task_id: Optional[str] = None
+        route_epoch: int = 0
+        deadline_ns: Optional[int] = None
+        max_prefetch_bytes: Optional[int] = None
+        priority: int = 0
+        start_chunk: Optional[int] = None
+        end_chunk: Optional[int] = None
+        ttl_ms: int = 5000
+
+    class PrefetchHintResponse(BaseModel):
+        event_id: str
+        accepted: int
+        scheduled: int
+        stale: bool = False
+
+    @app.post("/prefetch_hint", response_model=PrefetchHintResponse)
+    @app.post("/v1/cxl/prefetch", response_model=PrefetchHintResponse)
+    async def prefetch_hint(req: PrefetchHintRequest):
+        """Submit a non-blocking route-time LMCache prefetch hint."""
+        if not req.tokens:
+            raise HTTPException(status_code=422, detail="tokens must not be empty")
+        try:
+            event_id = "PrefetchHint" + str(uuid.uuid4())
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(
+                PrefetchHintMsg(
+                    event_id=event_id,
+                    instance_id=req.instance_id,
+                    tokens=req.tokens,
+                    request_id=req.request_id,
+                    session_id=req.session_id,
+                    model_id=req.model_id,
+                    route_epoch=req.route_epoch,
+                    deadline_ns=req.deadline_ns,
+                    max_prefetch_bytes=req.max_prefetch_bytes,
+                    priority=req.priority,
+                    task_id=req.task_id,
+                    start_chunk=req.start_chunk,
+                    end_chunk=req.end_chunk,
+                    ttl_ms=req.ttl_ms,
+                )
+            )
+            # Route-time prefetch is best-effort.  A worker may finish or
+            # transition its control socket while this hint is being queued;
+            # surface that race as a stale no-op instead of HTTP 500.  The
+            # router can then continue serving the demand request normally.
+            if isinstance(ret_msg, ErrorMsg):
+                logger.warning(
+                    "Ignoring prefetch hint race: instance_id=%s request_id=%s "
+                    "tokens=%d route_epoch=%d error=%s",
+                    req.instance_id,
+                    req.request_id,
+                    len(req.tokens),
+                    req.route_epoch,
+                    ret_msg.error,
+                )
+                return PrefetchHintResponse(
+                    event_id=event_id,
+                    accepted=0,
+                    scheduled=0,
+                    stale=True,
+                )
+            assert isinstance(ret_msg, PrefetchHintRetMsg)
+            return PrefetchHintResponse(
+                event_id=ret_msg.event_id,
+                accepted=ret_msg.accepted,
+                scheduled=ret_msg.scheduled,
+                stale=ret_msg.stale,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(
+                "LMCache prefetch hint failed: instance_id=%s request_id=%s "
+                "tokens=%d route_epoch=%d",
+                req.instance_id,
+                req.request_id,
+                len(req.tokens),
+                req.route_epoch,
+            )
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    class PrefetchStatusResponse(BaseModel):
+        event_id: str
+        task_id: str
+        state: str
+        requested_chunks: int = 0
+        ready_chunks: int = 0
+        bytes_copied: int = 0
+        started_ns: Optional[int] = None
+        completed_ns: Optional[int] = None
+
+    @app.get("/v1/cxl/prefetch/{task_id}", response_model=PrefetchStatusResponse)
+    async def prefetch_status(task_id: str, instance_id: str):
+        """Return the worker-aggregated state of a global prefetch task."""
+        try:
+            event_id = "PrefetchStatus" + str(uuid.uuid4())
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(
+                PrefetchStatusMsg(
+                    event_id=event_id,
+                    instance_id=instance_id,
+                    task_id=task_id,
+                )
+            )
+            if isinstance(ret_msg, ErrorMsg):
+                raise HTTPException(status_code=404, detail=ret_msg.error)
+            assert isinstance(ret_msg, PrefetchStatusRetMsg)
+            return PrefetchStatusResponse(
+                event_id=ret_msg.event_id,
+                task_id=ret_msg.task_id,
+                state=ret_msg.state,
+                requested_chunks=ret_msg.requested_chunks,
+                ready_chunks=ret_msg.ready_chunks,
+                bytes_copied=ret_msg.bytes_copied,
+                started_ns=ret_msg.started_ns,
+                completed_ns=ret_msg.completed_ns,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    class CancelPrefetchHintRequest(BaseModel):
+        instance_id: str
+        request_id: str
+        route_epoch: int
+
+    class CancelPrefetchHintResponse(BaseModel):
+        event_id: str
+        cancelled: int
+
+    @app.post("/cancel_prefetch_hint", response_model=CancelPrefetchHintResponse)
+    async def cancel_prefetch_hint(req: CancelPrefetchHintRequest):
+        try:
+            event_id = "CancelPrefetchHint" + str(uuid.uuid4())
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(
+                CancelPrefetchHintMsg(
+                    event_id=event_id,
+                    instance_id=req.instance_id,
+                    request_id=req.request_id,
+                    route_epoch=req.route_epoch,
+                )
+            )
+            # Cancellation is best-effort and idempotent.  The route may have
+            # already completed, expired, or lost its worker socket by the
+            # time the frontend sends the cancellation request.  Treat those
+            # control-plane races as a successful no-op instead of exposing a
+            # spurious HTTP 500 to the router.
+            if isinstance(ret_msg, ErrorMsg):
+                logger.warning(
+                    "Ignoring prefetch cancellation race: instance_id=%s "
+                    "request_id=%s route_epoch=%d error=%s",
+                    req.instance_id,
+                    req.request_id,
+                    req.route_epoch,
+                    ret_msg.error,
+                )
+                return CancelPrefetchHintResponse(
+                    event_id=event_id,
+                    cancelled=0,
+                )
+            assert isinstance(ret_msg, CancelPrefetchHintRetMsg)
+            return CancelPrefetchHintResponse(
+                event_id=ret_msg.event_id,
+                cancelled=ret_msg.cancelled,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(
+                "LMCache prefetch cancellation failed: instance_id=%s request_id=%s "
+                "route_epoch=%d",
+                req.instance_id,
+                req.request_id,
+                req.route_epoch,
+            )
             raise HTTPException(status_code=500, detail=str(e)) from e
 
     class HealthRequest(BaseModel):

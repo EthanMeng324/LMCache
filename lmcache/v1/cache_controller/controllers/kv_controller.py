@@ -22,6 +22,14 @@ from lmcache.v1.cache_controller.message import (
     LookupRetMsg,
     MoveMsg,
     MoveRetMsg,
+    PrefetchHintMsg,
+    PrefetchHintRetMsg,
+    PrefetchStatusMsg,
+    PrefetchStatusRetMsg,
+    CancelPrefetchHintMsg,
+    CancelPrefetchHintRetMsg,
+    OffloadMsg,
+    OffloadRetMsg,
     PinMsg,
     PinRetMsg,
 )
@@ -147,6 +155,25 @@ class KVController:
         """
         assert self.cluster_executor is not None
         return await self.cluster_executor.execute("move", msg)
+
+    async def prefetch_hint(self, msg: PrefetchHintMsg) -> PrefetchHintRetMsg:
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("prefetch_hint", msg)
+
+    async def cancel_prefetch_hint(
+        self, msg: CancelPrefetchHintMsg
+    ) -> CancelPrefetchHintRetMsg:
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("cancel_prefetch_hint", msg)
+
+    async def prefetch_status(self, msg: PrefetchStatusMsg) -> PrefetchStatusRetMsg:
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("prefetch_status", msg)
+
+    async def offload(self, msg: OffloadMsg) -> OffloadRetMsg:
+        """Fan out one bounded CPU-to-CXL copy to the TP group."""
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("offload", msg)
 
     async def check_finish(self, msg: CheckFinishMsg) -> CheckFinishRetMsg:
         """

@@ -46,7 +46,8 @@ static void acquire_lock(atomic_flag *lock) {
 }
 static uint64_t str2hash(const char *str);
 static int find_meta_hash_idx(const char *name);
-static int find_avail_hash_idx(const char *name, uint64_t *out_offset);
+static int find_avail_hash_idx(const char *name, uint64_t *out_offset,
+                               size_t required_size);
 
 #define LOCK_TIMEOUT_NS 6000000000  // 6 second timeout
 
@@ -85,7 +86,10 @@ __attribute__((visibility("default"))) int clflush_region_with_mfence(void *addr
     uintptr_t p = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
     uintptr_t end = ((uintptr_t)addr + size + CACHELINE_SIZE - 1) & ~(CACHELINE_SIZE - 1);
     do {
-        _mm_clflushopt((void*)p);
+        // NOTE: use clflush (SSE2 baseline) rather than clflushopt so the
+        // library runs on pre-Skylake CPUs (e.g. Haswell/Broadwell) that lack
+        // clflushopt. The trailing mfence below makes plain clflush correct.
+        _mm_clflush((void*)p);
         p += CACHELINE_SIZE;
     } while (p < end);
     _mm_mfence();
@@ -335,7 +339,7 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
  
     // Find a free slot
     uint64_t reused_offset = 0;
-    int free_idx = find_avail_hash_idx(name, &reused_offset);
+    int free_idx = find_avail_hash_idx(name, &reused_offset, size);
     if (free_idx == -1) {
         fprintf(stderr, "No free slots available for shared objects\n");
         // cxl_release_lock(&meta->head.lock, my_pid);
@@ -359,7 +363,10 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
             fprintf(stderr, "Not enough space in DAX device, device size %zu, data size: %zu, obj_offset: %lu, meta->head.curr_offset: %lu \n", dax_size, size, obj_offset, meta->head.curr_offset);
             // cxl_release_lock(&meta->head.lock, my_pid);
             cxl_release_smart_lock();
-            abort();
+            // Capacity pressure is a normal cache condition.  In particular,
+            // predictive CPU->CXL offload must be able to fail one object and
+            // leave the serving worker alive (with its CPU source intact).
+            // Propagate a recoverable allocation error through the C binding.
             return -1;
         }
     }
@@ -391,7 +398,32 @@ __attribute__((visibility("default"))) int cxl_shm_create(const char *name, size
  
     return 0;
 }
- 
+
+// Publish the logical payload size after the writer has copied and flushed the
+// object.  cxl_shm_create() intentionally initializes actual_size to zero for
+// CPU-to-CXL prepare operations, so readers cannot mistake a prepared object
+// for a committed CXL entry.
+__attribute__((visibility("default"))) int cxl_shm_set_actual_size(
+    cxl_shm_hnd_t *hnd, size_t actual_size) {
+    if (!hnd || !hnd->obj) return -1;
+    if (cxl_acquire_smart_lock()) {
+        fprintf(stderr, "cxl_shm_set_actual_size failed to acquire the lock\n");
+        return -1;
+    }
+
+    if (!hnd->obj->in_use) {
+        cxl_release_smart_lock();
+        return -1;
+    }
+    if (actual_size > hnd->obj->size) {
+        actual_size = hnd->obj->size;
+    }
+    hnd->obj->actual_size = actual_size;
+    clflush_region_with_mfence(hnd->obj, sizeof(cxl_shm_obj_meta_t));
+    cxl_release_smart_lock();
+    return 0;
+}
+
 // Open an existing shared memory object
 __attribute__((visibility("default"))) int cxl_shm_open_obj(const char *name, cxl_shm_hnd_t *hnd) {
     if (!name || !hnd) return -1;
@@ -602,7 +634,8 @@ static int find_meta_hash_idx(const char *name) {
     return -1;
 }
 
-static int find_avail_hash_idx(const char *name, uint64_t *out_offset) {
+static int find_avail_hash_idx(const char *name, uint64_t *out_offset,
+                               size_t required_size) {
     int idx = -1;
     uint32_t base_pos = 0;
     uint64_t key = str2hash(name);
@@ -611,6 +644,14 @@ static int find_avail_hash_idx(const char *name, uint64_t *out_offset) {
 		idx =  base_pos + (key % mh->bucket[i]);
         clflush_region_with_mfence(&meta->objs[idx], sizeof(cxl_shm_obj_meta_t));
         if (!meta->objs[idx].in_use) {
+           // A destroyed slot retains its old allocation.  Reusing it for a
+           // larger object would overlap the following allocation and corrupt
+           // both objects.  A never-used slot has offset/size == 0 and is
+           // still valid for a fresh allocation from curr_offset.
+           if (meta->objs[idx].offset != 0 &&
+               meta->objs[idx].size < required_size) {
+               continue;
+           }
            if (out_offset) *out_offset = (uint64_t)meta->objs[idx].offset;
            return idx;
         }

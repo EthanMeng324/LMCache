@@ -1098,6 +1098,8 @@ class LMCacheConnectorV1Impl:
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     request_configs=request.request_configs,
                     req_id=request.req_id,
+                    association_tokens=tokens,
+                    association_mask=token_mask,
                     skip_contains_check=True,
                     backend_hit_tokens=backend_hit_tokens,
                 )

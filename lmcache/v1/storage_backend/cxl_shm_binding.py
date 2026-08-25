@@ -88,6 +88,11 @@ _lib.cxl_shm_finalize.restype = c_int
 _lib.cxl_shm_create.argtypes = [c_char_p, c_size_t, c_size_t, POINTER(CxlShmHnd)]
 _lib.cxl_shm_create.restype = c_int
 
+_set_actual_size = getattr(_lib, "cxl_shm_set_actual_size", None)
+if _set_actual_size is not None:
+    _set_actual_size.argtypes = [POINTER(CxlShmHnd), c_size_t]
+    _set_actual_size.restype = c_int
+
 _lib.cxl_shm_open_obj.argtypes = [c_char_p, POINTER(CxlShmHnd)]
 _lib.cxl_shm_open_obj.restype = c_int
 
@@ -173,6 +178,24 @@ class CxlShmWrapper:
         if result == 0:
             return (0, hnd)
         return (result, None)
+
+    def set_actual_size(self, hnd: CxlShmHnd, actual_size: int) -> int:
+        """Publish the logical payload size after a complete native write.
+
+        Older locally built libraries do not expose this setter. The fallback
+        updates the mapped metadata and flushes that cache line so the Python
+        binding remains usable until the native library is rebuilt.
+        """
+        if not hnd.obj:
+            return -1
+        actual_size = min(int(actual_size), int(hnd.obj_contents.size))
+        if _set_actual_size is not None:
+            return _set_actual_size(ctypes.byref(hnd), actual_size)
+        hnd.obj_contents.actual_size = actual_size
+        metadata_addr = ctypes.addressof(hnd.obj_contents)
+        return self.flush(
+            ctypes.c_void_p(metadata_addr), ctypes.sizeof(CxlShmObjMeta)
+        )
     
     def open_obj(self, name: str) -> Tuple[int, Optional[CxlShmHnd]]:
         """
@@ -273,4 +296,3 @@ class CxlShmWrapper:
             return None
         n = int(rc)
         return [(int(idxs[i]), int(in_use[i])) for i in range(n)]
-

@@ -505,6 +505,84 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # Correlation prefetch.  The feature is default-off; the limits are
+    # intentionally explicit so enabling it cannot create unbounded CXL or
+    # pinned-CPU work.
+    "enable_correlation_prefetch": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "prefetch_top_k": {"type": int, "default": 4, "env_converter": int},
+    "prefetch_degree": {"type": int, "default": 1, "env_converter": int},
+    "prefetch_min_support": {"type": float, "default": 16.0, "env_converter": float},
+    "prefetch_second_order_enabled": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "prefetch_stream_depth": {"type": int, "default": 2, "env_converter": int},
+    "prefetch_cpu_capacity_ratio": {
+        "type": float,
+        "default": 0.10,
+        "env_converter": float,
+    },
+    "prefetch_bandwidth_ratio": {
+        "type": float,
+        "default": 0.15,
+        "env_converter": float,
+    },
+    "prefetch_bandwidth_bytes_per_second": {
+        "type": float,
+        "default": 0.0,
+        "env_converter": float,
+    },
+    "prefetch_max_inflight_tasks": {
+        "type": int,
+        "default": 16,
+        "env_converter": int,
+    },
+    "prefetch_max_inflight_requests": {
+        "type": int,
+        "default": 16,
+        "env_converter": int,
+    },
+    "prefetch_max_inflight_bytes": {
+        "type": int,
+        "default": 4 * 1024**3,
+        "env_converter": int,
+    },
+    "prefetch_ttl_ms": {"type": int, "default": 500, "env_converter": int},
+    "prefetch_score_threshold": {
+        "type": float,
+        "default": 0.25,
+        "env_converter": float,
+    },
+    "prefetch_decay_half_life_sec": {
+        "type": float,
+        "default": 60.0,
+        "env_converter": float,
+    },
+    "prefetch_global_merge_enabled": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "prefetch_pattern_export_interval_ms": {
+        "type": int,
+        "default": 2000,
+        "env_converter": int,
+    },
+    "emit_dynamo_tier_events": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "dynamo_prefetch_hint_endpoint": {
+        "type": str,
+        "default": None,
+        "env_converter": str,
+    },
 }
 
 

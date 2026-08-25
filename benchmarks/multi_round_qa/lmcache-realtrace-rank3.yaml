@@ -1,0 +1,15 @@
+# Rank-specific companion to lmcache-realtrace.yaml.
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 2
+enable_kv_events: true
+
+extra_config:
+  cxl_dax_device: /dev/shm/lmcache-cxl.img
+  max_cxl_size: 1
+  cxl_num_procs: 4
+  cxl_rank: 3
+  cxl_reset_on_init: none
+  cxl_global_prefetch_enabled: true
+  cxl_global_prefetch_max_inflight_bytes: 134217728
+  prefetch_cpu_capacity_ratio: 0.10

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.cache_engine import _select_cxl_prefetch_keys
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
@@ -62,6 +63,46 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             st, ed, key = new_results[j]
             assert st == original_results[j + i][0]
             assert ed == original_results[j + i][1]
+
+
+def test_reactive_prefetch_window_contains_complete_lmcache_chunks():
+    """A two-chunk reactive hint must produce two usable LMCache keys.
+
+    Reactive routing intentionally bounds the token window before sending it
+    to the worker.  With ``save_unfull_chunk=False`` a 128-token window (the
+    old Dynamo 2 * 64 block window) produces no key at all for the default
+    256-token LMCache chunk size.
+    """
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=256, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    results = list(db.process_tokens(tokens=list(range(512))))
+
+    assert len(results) == 2
+    assert [(start, end) for start, end, _ in results] == [
+        (0, 256),
+        (256, 512),
+    ]
+
+
+def test_sparse_reactive_prefetch_selects_only_requested_prefix_positions():
+    """A local/GPU gap must not prevent a later CXL block from being promoted."""
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=256, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = list(range(4 * 256))
+    all_keys = [key for _, _, key in db.process_tokens(tokens=tokens)]
+
+    selected = _select_cxl_prefetch_keys(
+        db,
+        tokens,
+        max_chunks=2,
+        candidate_block_indices=[1, 3],
+    )
+
+    assert selected == [all_keys[1], all_keys[3]]
 
 
 @pytest.mark.parametrize("prefix_length", [0, 16, 64, 256])
