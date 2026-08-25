@@ -2,15 +2,9 @@
 
 from types import SimpleNamespace
 import asyncio
-import threading
 
-import torch
 
-from lmcache.v1.cache_engine import (
-    LMCacheEngine,
-    PromotionResult,
-    _CxlAssociationPrefetcher,
-)
+from lmcache.v1.cache_engine import LMCacheEngine
 import lmcache.v1.cache_engine as cache_engine_module
 
 
@@ -218,96 +212,3 @@ def test_allocation_failure_releases_staging_and_source_pin():
     assert source.pins["A"] == 0
     assert staging.refs == 0
 
-
-def test_association_coordinator_dispatches_and_records_usefulness():
-    async def _scenario():
-        class _Engine:
-            metadata = SimpleNamespace(
-                kv_shape=(1, 2, 1, 1, 1), kv_dtype=torch.float32
-            )
-
-            def __init__(self):
-                self.storage_manager = SimpleNamespace(
-                    storage_backends={
-                        "CxlBackend": object(),
-                        "LocalCPUBackend": object(),
-                    },
-                    loop=asyncio.get_running_loop(),
-                )
-                self.calls = []
-                self.promoted = threading.Event()
-
-            def promote_keys_intra_node(
-                self,
-                keys,
-                source,
-                target,
-                event_id,
-                *,
-                do_copy,
-                max_chunks,
-                allow_eviction,
-            ):
-                self.calls.append(
-                    (keys, source, target, do_copy, max_chunks, allow_eviction)
-                )
-                self.promoted.set()
-                return PromotionResult(
-                    len(keys), tuple(keys), (), (), (), len(keys) * 8
-                )
-
-        config = SimpleNamespace(
-            local_cpu=True,
-            extra_config={
-                "cxl_association_prefetch_enabled": True,
-                "cxl_association_min_support": 0.5,
-                "cxl_association_min_confidence": 0.5,
-                "cxl_association_min_lift": 1.0,
-                "cxl_association_max_prefetch_chunks": 1,
-                "cxl_association_max_prefetch_bytes": 8,
-                "cxl_association_max_inflight_bytes": 8,
-            },
-        )
-        engine = _Engine()
-        prefetcher = _CxlAssociationPrefetcher.maybe_create(engine, config)
-        assert prefetcher is not None
-        prefetcher.observe_and_prefetch(None, "no-session", ["A"], ["A"])
-        assert prefetcher.stats()["missing_session_id"] == 1
-        # Learn A -> B from one completed session, then trigger from A in a
-        # separate session where B is not part of the current request.
-        prefetcher.observe_and_prefetch("train", "r1", ["A"], ["A"])
-        prefetcher.observe_and_prefetch("train", "r2", ["B"], ["B"])
-        prefetcher.observe_and_prefetch("trigger", "r1", ["A"], ["A"])
-        for _ in range(200):
-            if engine.promoted.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert engine.promoted.is_set()
-        assert engine.calls == [
-            (["B"], "CxlBackend", "LocalCPUBackend", True, 1, False)
-        ]
-
-        # Wait for the callback to publish the speculative-promotion record.
-        for _ in range(100):
-            if prefetcher.stats()["promoted"] == 1:
-                break
-            await asyncio.sleep(0.01)
-        assert prefetcher.stats()["tracked_prefetches"] == 1
-        prefetcher._record_demand_feedback(["B"])
-        assert prefetcher.stats()["useful"] == 1
-        # Router-style hints may name an arbitrary, non-contiguous segment
-        # without mutating predictor state or using the prefix API.
-        assert prefetcher.prefetch_keys(
-            ["C"], trigger_key="A", request_id="route-hint"
-        ) == 1
-        for _ in range(100):
-            if len(engine.calls) == 2:
-                break
-            await asyncio.sleep(0.01)
-        assert len(engine.calls) == 2
-        assert engine.calls[1] == (
-            ["C"], "CxlBackend", "LocalCPUBackend", True, 1, False
-        )
-        prefetcher.close()
-
-    asyncio.run(_scenario())

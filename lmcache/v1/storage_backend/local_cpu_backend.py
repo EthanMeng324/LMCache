@@ -137,7 +137,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
         ``cpu_lock`` must be held by the caller.  Iterating ``hot_cache`` keeps
         the cache policy's LRU order while the membership check gives
         speculative entries an admission-protection priority.
+
+        When prefetch is inactive ``prefetch_keys`` stays empty for the whole
+        process lifetime, so skip the scan entirely: this runs once per evicted
+        chunk inside ``batched_allocate``'s retry loop while ``cpu_lock`` is
+        held, and the scan is O(len(hot_cache)) for no possible gain.
         """
+        if not self.prefetch_keys:
+            return self.cache_policy.get_evict_candidates(
+                self.hot_cache, num_candidates=num_candidates
+            )
+
         now_ns = time.time_ns()
         probationary = [
             key
