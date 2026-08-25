@@ -9,12 +9,28 @@ identifier, so it is safe to put on a control-plane message.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 import hashlib
+import sys
 import time
 from typing import Any, Optional
 
 from lmcache.utils import CacheEngineKey
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:  # pragma: no cover - Python 3.10 compatibility shim
+    # enum.StrEnum landed in 3.11, but pyproject declares requires-python
+    # ">=3.10" and CI still runs 3.10.  A bare ``(str, Enum)`` is not
+    # equivalent: its ``str()``/``format()`` yield "PrefetchState.QUEUED"
+    # instead of the member value, and these values are carried as plain
+    # ``str`` over the cache-controller wire (message.py PrefetchStatus*).
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Minimal stand-in for :class:`enum.StrEnum` on Python 3.10."""
+
+        __str__ = str.__str__
+        __format__ = str.__format__
 
 
 class PrefetchState(StrEnum):
